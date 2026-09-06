@@ -1,0 +1,17 @@
+| Phase | Class                                   | Status    |
+| ----- | --------------------------------------- | --------- |
+| 1     | `DataLoader`                            | Completed |
+| 2     | `FiveMinuteMarketDataAligner`           | Completed      |
+| 3     | `FiveMinuteResidualEngine`              | Completed   |
+| 4     | `FiveMinuteRegimeEngine`                | Next   |
+| 5     | `FiveMinuteVolumeEngine`                | Pending   |
+| 6     | `FiveMinuteVolatilityEngine`            | Pending   |
+| 7     | `FiveMinuteMathematicalScoreEngine`     | Pending   |
+| 8     | `FiveMinuteCrossSectionalRanker`        | Pending   |
+| 9     | `FiveMinuteMathematicalSignalEngine`    | Pending   |
+| 10    | `FiveMinuteRiskEngine`                  | Pending   |
+| 11    | `FiveMinuteResidualStatisticalStrategy` | Pending   |
+| 12    | Backtester                              | Pending   |
+
+
+

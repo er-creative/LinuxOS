@@ -1,0 +1,8 @@
+
+python -u FiveMinuteForwardTestPhaseA.py \
+    --interval-seconds 20
+    
+python -u FiveMinuteForwardTestPhaseB.py \
+    --poll-seconds 20 \
+    --maximum-signal-age-minutes 180 \
+    --maximum-open-positions 2
