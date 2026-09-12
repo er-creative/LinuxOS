@@ -30,6 +30,9 @@ class FiveMinuteCrossSectionalRanker:
         "Latest_Residual_ZScore",
         "Latest_Volume_Factor",
         "Latest_Mathematical_Score",
+        "Latest_Residual_Quality_Score",
+        "Latest_Expected_Move_Percent",
+        "Latest_Edge_To_Cost_Ratio",
         "Latest_Setup_Ready",
         "Latest_Setup_Accepted",
         "Latest_Volatility_Eligible",
@@ -51,6 +54,8 @@ class FiveMinuteCrossSectionalRanker:
         "Mathematical_Percentile",
         "Residual_Percentile",
         "Volume_Percentile",
+        "Quality_Percentile",
+        "Economic_Edge_Percentile",
         "Latest_Cross_Sectional_Score",
         "Latest_Rank",
         "Latest_Candidate_Count",
@@ -66,9 +71,11 @@ class FiveMinuteCrossSectionalRanker:
     def __init__(
         self,
         maximum_selected_symbols=5,
-        mathematical_weight=0.60,
-        residual_weight=0.25,
-        volume_weight=0.15,
+        mathematical_weight=0.45,
+        residual_weight=0.15,
+        volume_weight=0.10,
+        quality_weight=0.20,
+        economic_edge_weight=0.10,
         maximum_staleness_minutes=15,
         mathematical_score_file=DEFAULT_SCORE_FILE,
         accepted_sheet_name=DEFAULT_SHEET,
@@ -83,7 +90,8 @@ class FiveMinuteCrossSectionalRanker:
             raise ValueError("maximum_selected_symbols must be at least 1")
 
         weights = np.asarray(
-            [mathematical_weight, residual_weight, volume_weight],
+            [mathematical_weight, residual_weight, volume_weight,
+             quality_weight, economic_edge_weight],
             dtype=np.float64,
         )
         if not np.isfinite(weights).all() or (weights < 0).any():
@@ -97,6 +105,8 @@ class FiveMinuteCrossSectionalRanker:
         self.mathematical_weight = float(mathematical_weight)
         self.residual_weight = float(residual_weight)
         self.volume_weight = float(volume_weight)
+        self.quality_weight = float(quality_weight)
+        self.economic_edge_weight = float(economic_edge_weight)
         self.maximum_staleness_minutes = maximum_staleness_minutes
         self.mathematical_score_file = str(mathematical_score_file)
         self.accepted_sheet_name = str(accepted_sheet_name)
@@ -175,6 +185,9 @@ class FiveMinuteCrossSectionalRanker:
             "Latest_Residual_ZScore",
             "Latest_Volume_Factor",
             "Latest_Mathematical_Score",
+            "Latest_Residual_Quality_Score",
+            "Latest_Expected_Move_Percent",
+            "Latest_Edge_To_Cost_Ratio",
         ]
         for column in numeric:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -217,6 +230,9 @@ class FiveMinuteCrossSectionalRanker:
                 "Latest_Residual_ZScore",
                 "Latest_Volume_Factor",
                 "Latest_Mathematical_Score",
+                "Latest_Residual_Quality_Score",
+                "Latest_Expected_Move_Percent",
+                "Latest_Edge_To_Cost_Ratio",
             ]
         ].notna().all(axis=1)
         directional = accepted["Latest_Stable_Regime"].isin(
@@ -238,6 +254,8 @@ class FiveMinuteCrossSectionalRanker:
             result["Mathematical_Percentile"] = np.nan
             result["Residual_Percentile"] = np.nan
             result["Volume_Percentile"] = np.nan
+            result["Quality_Percentile"] = np.nan
+            result["Economic_Edge_Percentile"] = np.nan
             result["Latest_Cross_Sectional_Score"] = np.nan
             result["Latest_Rank"] = pd.NA
         else:
@@ -250,11 +268,19 @@ class FiveMinuteCrossSectionalRanker:
             candidates["Volume_Percentile"] = self._percentile(
                 candidates["Latest_Volume_Factor"]
             )
+            candidates["Quality_Percentile"] = self._percentile(
+                candidates["Latest_Residual_Quality_Score"]
+            )
+            candidates["Economic_Edge_Percentile"] = self._percentile(
+                candidates["Latest_Edge_To_Cost_Ratio"]
+            )
             candidates["Latest_Cross_Sectional_Score"] = (
                 self.mathematical_weight
                 * candidates["Mathematical_Percentile"]
                 + self.residual_weight * candidates["Residual_Percentile"]
                 + self.volume_weight * candidates["Volume_Percentile"]
+                + self.quality_weight * candidates["Quality_Percentile"]
+                + self.economic_edge_weight * candidates["Economic_Edge_Percentile"]
             )
             candidates.sort_values(
                 by=[
@@ -274,6 +300,8 @@ class FiveMinuteCrossSectionalRanker:
                     "Mathematical_Percentile",
                     "Residual_Percentile",
                     "Volume_Percentile",
+                    "Quality_Percentile",
+                    "Economic_Edge_Percentile",
                     "Latest_Cross_Sectional_Score",
                     "Latest_Rank",
                 ]
@@ -283,6 +311,8 @@ class FiveMinuteCrossSectionalRanker:
                     "Mathematical_Percentile",
                     "Residual_Percentile",
                     "Volume_Percentile",
+                    "Quality_Percentile",
+                    "Economic_Edge_Percentile",
                     "Latest_Cross_Sectional_Score",
                     "Latest_Rank",
                 ],
@@ -445,3 +475,44 @@ class FiveMinuteCrossSectionalRanker:
     def calculate_all_from_excel(self, **kwargs):
         return self.rank_from_excel(**kwargs)
 
+    def rank_all(self, score_data):
+        """Rank accepted latest rows already held in memory.
+
+        This compatibility path avoids a workbook read in notebooks.  The
+        production Phase-A path can continue to use ``rank_from_excel``.
+        """
+        rows = []
+        for symbol, frame in score_data.items():
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            latest = frame.iloc[-1]
+            row = {"Symbol": symbol, "Status": "CALCULATED"}
+            for column in self.INPUT_COLUMNS:
+                if column not in row:
+                    source = column.removeprefix("Latest_")
+                    row[column] = latest.get(source, latest.get(column, np.nan))
+            rows.append(row)
+        accepted = pd.DataFrame(rows)
+        if accepted.empty:
+            report = self._empty_report()
+        else:
+            accepted["Latest_Setup_Ready"] = self._as_boolean(
+                accepted["Latest_Setup_Ready"]
+            )
+            accepted["Latest_Setup_Accepted"] = self._as_boolean(
+                accepted["Latest_Setup_Accepted"]
+            )
+            accepted = accepted.loc[
+                accepted["Latest_Setup_Ready"]
+                & accepted["Latest_Setup_Accepted"]
+            ].copy()
+            report = self._rank(accepted)
+        if self.save_excel:
+            report.attrs["Excel_File"] = self._write_excel(
+                report, self.ranking_output_file
+            )
+        ranked = {
+            row.Symbol: pd.DataFrame([row._asdict()])
+            for row in report.itertuples(index=False)
+        }
+        return ranked, report

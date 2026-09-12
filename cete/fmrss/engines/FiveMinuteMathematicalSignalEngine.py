@@ -20,6 +20,10 @@ class FiveMinuteMathematicalSignalEngine:
     MATHEMATICAL_COLUMNS = [
         "Symbol", "Latest_DateTime", "Latest_Stable_Regime",
         "Latest_Residual_Impulse", "Latest_Residual_ZScore",
+        "Latest_Residual_Return", "Latest_Close", "Latest_Previous_Close",
+        "Latest_Residual_Fair_Value", "Latest_Expected_Move_Percent",
+        "Latest_Edge_To_Cost_Ratio", "Latest_Residual_Half_Life",
+        "Latest_Residual_Quality_Score",
         "Latest_Volume_Factor", "Latest_Mathematical_Score",
         "Latest_Setup_Ready", "Latest_Setup_Accepted",
         "Latest_Volatility_Eligible", "Latest_Volume_Confirmed",
@@ -29,12 +33,26 @@ class FiveMinuteMathematicalSignalEngine:
         "Symbol", "Decision_DateTime", "Ranking_Source_DateTime",
         "Mathematical_DateTime", "Rank", "Regime",
         "Residual_ZScore", "Previous_Residual_ZScore",
-        "Reversion_Turn_Confirmed", "Residual_Impulse", "Volume_Factor",
+        "Signal_Armed", "Armed_Direction", "Armed_DateTime",
+        "Armed_Age_Candles", "Maximum_Armed_Abs_ZScore",
+        "ZScore_Turn_Confirmed", "Residual_Return_Confirmed",
+        "Reversion_Confirmation_Count",
+        "Reversion_Turn_Confirmed", "Price_Turn_Confirmed",
+        "Residual_Impulse", "Residual_Return", "Volume_Factor",
+        "Latest_Close", "Residual_Fair_Value", "Expected_Move_Percent",
+        "Edge_To_Cost_Ratio", "Residual_Half_Life",
+        "Residual_Quality_Score",
         "Mathematical_Score", "Cross_Sectional_Score",
         "Timestamp_Matched", "Mathematical_Validated",
         "Ranking_Fallback_Used", "Signal_Eligible",
         "Mathematical_Signal", "Signal_Direction", "Signal_Strength",
         "Signal_Reason", "Calculation_Backend",
+    ]
+    STATE_COLUMNS = [
+        "Symbol", "Last_DateTime", "Previous_ZScore",
+        "Maximum_Abs_ZScore", "Armed_Direction", "Armed_DateTime",
+        "Armed_Cycles", "Last_Rank", "Last_Regime",
+        "Last_Selected_DateTime", "Last_Signal_DateTime",
     ]
     DIRECTIONAL_REGIMES = {"MOMENTUM", "MEAN_REVERSION"}
 
@@ -47,13 +65,20 @@ class FiveMinuteMathematicalSignalEngine:
         output_file=(
             "/home/devinderjeet/fmrss/report/MathematicalSignals.xlsx"
         ),
+        signal_state_file=None,
         maximum_selected_symbols=5,
         momentum_minimum_abs_zscore=1.00,
-        mean_reversion_minimum_abs_zscore=2.25,
+        mean_reversion_minimum_abs_zscore=2.50,
         minimum_abs_impulse=0.0,
         allow_momentum_entries=False,
         allow_mean_reversion_entries=True,
         require_mean_reversion_turn=True,
+        require_previous_zscore_turn=True,
+        mean_reversion_arm_abs_zscore=None,
+        mean_reversion_entry_abs_zscore=2.20,
+        mean_reversion_minimum_remaining_abs_zscore=1.50,
+        minimum_reversion_confirmations=2,
+        maximum_armed_age_candles=12,
         mathematical_strength_weight=0.70,
         cross_sectional_strength_weight=0.30,
         score_match_tolerance=0.05,
@@ -75,6 +100,33 @@ class FiveMinuteMathematicalSignalEngine:
             raise ValueError("minimum_abs_impulse must be finite and non-negative")
         if not np.isfinite(score_match_tolerance) or score_match_tolerance < 0:
             raise ValueError("score_match_tolerance must be finite and non-negative")
+        arm_threshold = (
+            mean_reversion_minimum_abs_zscore
+            if mean_reversion_arm_abs_zscore is None
+            else mean_reversion_arm_abs_zscore
+        )
+        for name, value in {
+            "mean_reversion_arm_abs_zscore": arm_threshold,
+            "mean_reversion_entry_abs_zscore": mean_reversion_entry_abs_zscore,
+            "mean_reversion_minimum_remaining_abs_zscore": (
+                mean_reversion_minimum_remaining_abs_zscore
+            ),
+        }.items():
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not (
+            mean_reversion_minimum_remaining_abs_zscore
+            <= mean_reversion_entry_abs_zscore
+            < arm_threshold
+        ):
+            raise ValueError(
+                "Mean-reversion thresholds must satisfy minimum remaining "
+                "<= entry < arm"
+            )
+        if minimum_reversion_confirmations not in {1, 2, 3}:
+            raise ValueError("minimum_reversion_confirmations must be 1, 2 or 3")
+        if maximum_armed_age_candles < 1:
+            raise ValueError("maximum_armed_age_candles must be positive")
 
         weights = np.asarray(
             [mathematical_strength_weight, cross_sectional_strength_weight],
@@ -88,6 +140,9 @@ class FiveMinuteMathematicalSignalEngine:
         self.ranking_file = str(ranking_file)
         self.mathematical_score_file = str(mathematical_score_file)
         self.output_file = str(output_file) if output_file else None
+        self.signal_state_file = (
+            str(signal_state_file) if signal_state_file else None
+        )
         self.maximum_selected_symbols = int(maximum_selected_symbols)
         self.momentum_minimum_abs_zscore = float(momentum_minimum_abs_zscore)
         self.mean_reversion_minimum_abs_zscore = float(
@@ -101,6 +156,20 @@ class FiveMinuteMathematicalSignalEngine:
         self.require_mean_reversion_turn = bool(
             require_mean_reversion_turn
         )
+        self.require_previous_zscore_turn = bool(
+            require_previous_zscore_turn
+        )
+        self.mean_reversion_arm_abs_zscore = float(arm_threshold)
+        self.mean_reversion_entry_abs_zscore = float(
+            mean_reversion_entry_abs_zscore
+        )
+        self.mean_reversion_minimum_remaining_abs_zscore = float(
+            mean_reversion_minimum_remaining_abs_zscore
+        )
+        self.minimum_reversion_confirmations = int(
+            minimum_reversion_confirmations
+        )
+        self.maximum_armed_age_candles = int(maximum_armed_age_candles)
         self.mathematical_strength_weight = float(mathematical_strength_weight)
         self.cross_sectional_strength_weight = float(
             cross_sectional_strength_weight
@@ -244,6 +313,12 @@ class FiveMinuteMathematicalSignalEngine:
             "Latest_DateTime": "Mathematical_DateTime",
             "Latest_Stable_Regime": "Mathematical_Regime",
             "Latest_Residual_Impulse": "Residual_Impulse",
+            "Latest_Residual_Return": "Residual_Return",
+            "Latest_Residual_Fair_Value": "Residual_Fair_Value",
+            "Latest_Expected_Move_Percent": "Expected_Move_Percent",
+            "Latest_Edge_To_Cost_Ratio": "Edge_To_Cost_Ratio",
+            "Latest_Residual_Half_Life": "Residual_Half_Life",
+            "Latest_Residual_Quality_Score": "Residual_Quality_Score",
             "Latest_Residual_ZScore": "Mathematical_Residual_ZScore",
             "Latest_Volume_Factor": "Mathematical_Volume_Factor",
             "Latest_Mathematical_Score": "Mathematical_Report_Score",
@@ -260,6 +335,10 @@ class FiveMinuteMathematicalSignalEngine:
             "Mathematical_Score", "Cross_Sectional_Score", "Rank",
             "Mathematical_Residual_ZScore", "Mathematical_Volume_Factor",
             "Mathematical_Report_Score",
+            "Residual_Return", "Latest_Close", "Latest_Previous_Close",
+            "Residual_Fair_Value", "Expected_Move_Percent",
+            "Edge_To_Cost_Ratio", "Residual_Half_Life",
+            "Residual_Quality_Score",
         ]:
             result[column] = self._number(result[column])
 
@@ -272,6 +351,15 @@ class FiveMinuteMathematicalSignalEngine:
         result["Residual_Impulse"] = result["Residual_Impulse"].where(
             result["Timestamp_Matched"], np.nan
         )
+        for column in [
+            "Residual_Return", "Latest_Close", "Latest_Previous_Close",
+            "Residual_Fair_Value", "Expected_Move_Percent",
+            "Edge_To_Cost_Ratio", "Residual_Half_Life",
+            "Residual_Quality_Score",
+        ]:
+            result[column] = result[column].where(
+                result["Timestamp_Matched"], np.nan
+            )
         regime_match = result["Regime"].eq(result["Mathematical_Regime"])
         score_match = result["Mathematical_Score"].sub(
             result["Mathematical_Report_Score"]
@@ -297,119 +385,326 @@ class FiveMinuteMathematicalSignalEngine:
         )
         return result
 
-    def _signals(self, result):
-        regime = result["Regime"]
-        zscore = result["Residual_ZScore"]
-        impulse = result["Residual_Impulse"]
+    def _empty_state(self):
+        return pd.DataFrame(columns=self.STATE_COLUMNS)
+
+    def _load_signal_state(self):
+        if not self.signal_state_file \
+                or not os.path.isfile(self.signal_state_file):
+            return self._empty_state()
+        try:
+            state = pd.read_excel(
+                self.signal_state_file,
+                sheet_name="Signal_State",
+                engine="openpyxl",
+            ).reindex(columns=self.STATE_COLUMNS)
+        except (ValueError, OSError):
+            return self._empty_state()
+        if state.empty:
+            return state
+        state["Symbol"] = self._symbols(state["Symbol"])
+        for column in [
+            "Last_DateTime", "Armed_DateTime", "Last_Selected_DateTime",
+            "Last_Signal_DateTime",
+        ]:
+            state[column] = pd.to_datetime(state[column], errors="coerce")
+        for column in [
+            "Previous_ZScore", "Maximum_Abs_ZScore", "Last_Rank"
+        ]:
+            state[column] = self._number(state[column])
+        state["Armed_Cycles"] = pd.to_numeric(
+            state["Armed_Cycles"], errors="coerce"
+        ).fillna(0).astype(np.int16)
+        for column in ["Armed_Direction", "Last_Regime"]:
+            state[column] = (
+                state[column].astype("string").fillna("").str.upper()
+            )
+        state.dropna(subset=["Symbol"], inplace=True)
+        state.drop_duplicates("Symbol", keep="last", inplace=True)
+        state.reset_index(drop=True, inplace=True)
+        return state
+
+    def _save_signal_state(self, state):
+        if not self.signal_state_file:
+            return None
+        target = Path(self.signal_state_file).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        metadata = pd.DataFrame({
+            "Metric": [
+                "State Version", "Updated UTC", "Tracked Symbols",
+                "Armed Symbols", "Arm Z-Score", "Entry Z-Score",
+                "Minimum Remaining Z-Score", "Confirmations Required",
+                "Maximum Armed Age Candles",
+            ],
+            "Value": [
+                1, pd.Timestamp.now(tz="UTC").isoformat(), len(state),
+                int(state["Armed_Direction"].isin(["BUY", "SELL"]).sum()),
+                self.mean_reversion_arm_abs_zscore,
+                self.mean_reversion_entry_abs_zscore,
+                self.mean_reversion_minimum_remaining_abs_zscore,
+                self.minimum_reversion_confirmations,
+                self.maximum_armed_age_candles,
+            ],
+        })
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".fmrss_signal_state_", suffix=".xlsx", dir=target.parent
+        )
+        os.close(descriptor)
+        try:
+            with pd.ExcelWriter(temporary, engine="openpyxl") as writer:
+                self._excel_safe(metadata).to_excel(
+                    writer, sheet_name="Metadata", index=False
+                )
+                self._excel_safe(state).to_excel(
+                    writer, sheet_name="Signal_State", index=False
+                )
+                self._style(writer)
+            os.replace(temporary, target)
+        except Exception:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+            raise
+        return str(target)
+
+    def _signals(self, result, state):
         validation = result["Ranking_Validated"] & (
             result["Mathematical_Validated"] | result["Ranking_Fallback_Used"]
         )
-        previous_zscore = pd.Series(np.nan, index=result.index, dtype="float64")
-        if self.output_file and os.path.isfile(self.output_file):
-            try:
-                previous = pd.read_excel(
-                    self.output_file,
-                    sheet_name="Selected_Signals",
-                    usecols=["Symbol", "Decision_DateTime", "Residual_ZScore"],
-                    engine="openpyxl",
-                )
-                previous["Symbol"] = self._symbols(previous["Symbol"])
-                previous["Decision_DateTime"] = pd.to_datetime(
-                    previous["Decision_DateTime"], errors="coerce"
-                )
-                previous["Residual_ZScore"] = self._number(
-                    previous["Residual_ZScore"]
-                )
-                previous.sort_values("Decision_DateTime", inplace=True)
-                previous.drop_duplicates("Symbol", keep="last", inplace=True)
-                previous_map = previous.set_index("Symbol")["Residual_ZScore"]
-                previous_zscore = result["Symbol"].map(previous_map)
-                del previous, previous_map
-            except (ValueError, OSError, KeyError):
-                pass
+        state_by_symbol = {
+            str(row.Symbol): row._asdict()
+            for row in state.itertuples(index=False)
+        }
+        diagnostics = []
 
-        # A mean-reversion entry needs evidence that the residual has stopped
-        # extending: negative Z must rise for BUY; positive Z must fall for SELL.
-        reversion_turn = (
-            previous_zscore.notna()
-            & (
-                (zscore.lt(0) & zscore.gt(previous_zscore))
-                | (zscore.gt(0) & zscore.lt(previous_zscore))
+        for index, row in result.iterrows():
+            symbol = str(row["Symbol"])
+            now = pd.to_datetime(row["Decision_DateTime"], errors="coerce")
+            zscore = float(row["Residual_ZScore"])
+            regime = str(row["Regime"])
+            valid = bool(validation.loc[index])
+            prior = state_by_symbol.get(symbol, {})
+            previous_zscore = pd.to_numeric(
+                prior.get("Previous_ZScore"), errors="coerce"
             )
-        )
-        if not self.require_mean_reversion_turn:
-            reversion_turn = pd.Series(True, index=result.index)
+            armed_direction = str(
+                prior.get("Armed_Direction", "") or ""
+            ).upper()
+            armed_time = pd.to_datetime(
+                prior.get("Armed_DateTime"), errors="coerce"
+            )
+            armed_cycles_value = pd.to_numeric(
+                prior.get("Armed_Cycles", 0), errors="coerce"
+            )
+            armed_cycles = (
+                int(armed_cycles_value)
+                if pd.notna(armed_cycles_value)
+                else 0
+            )
+            maximum_abs_zscore = pd.to_numeric(
+                prior.get("Maximum_Abs_ZScore"), errors="coerce"
+            )
+            armed_age = (
+                (now - armed_time).total_seconds() / 300.0
+                if pd.notna(now) and pd.notna(armed_time)
+                else np.nan
+            )
+            expired = bool(
+                np.isfinite(armed_age)
+                and armed_age > self.maximum_armed_age_candles
+            )
+            if expired or regime != "MEAN_REVERSION":
+                armed_direction = ""
+                armed_time = pd.NaT
+                armed_cycles = 0
+                maximum_abs_zscore = np.nan
 
-        reversion = (
-            self.allow_mean_reversion_entries
-            & validation & regime.eq("MEAN_REVERSION")
-            & zscore.abs().ge(self.mean_reversion_minimum_abs_zscore)
-            & reversion_turn
-        )
-        momentum = (
-            self.allow_momentum_entries
-            & validation & result["Timestamp_Matched"] & regime.eq("MOMENTUM")
-            & zscore.abs().ge(self.momentum_minimum_abs_zscore)
-            & impulse.abs().gt(self.minimum_abs_impulse)
-            & np.sign(zscore).eq(np.sign(impulse))
-        )
-        buy = (reversion & zscore.lt(0)) | (momentum & impulse.gt(0))
-        sell = (reversion & zscore.gt(0)) | (momentum & impulse.lt(0))
-        signal = np.select([buy, sell], ["BUY", "SELL"], default="NO_TRADE")
+            expected_direction = "BUY" if zscore < 0 else "SELL"
+            was_armed = (
+                armed_direction == expected_direction
+                and pd.notna(armed_time)
+                and np.isfinite(maximum_abs_zscore)
+                and maximum_abs_zscore >= self.mean_reversion_arm_abs_zscore
+            )
+            zscore_turn = bool(
+                np.isfinite(previous_zscore)
+                and (
+                    (zscore < 0 and zscore > previous_zscore)
+                    or (zscore > 0 and zscore < previous_zscore)
+                )
+            )
+            residual_return = pd.to_numeric(
+                row["Residual_Return"], errors="coerce"
+            )
+            return_turn = bool(
+                np.isfinite(residual_return)
+                and (
+                    (zscore < 0 and residual_return > 0)
+                    or (zscore > 0 and residual_return < 0)
+                )
+            )
+            close = pd.to_numeric(row["Latest_Close"], errors="coerce")
+            previous_close = pd.to_numeric(
+                row["Latest_Previous_Close"], errors="coerce"
+            )
+            price_turn = bool(
+                np.isfinite(close) and np.isfinite(previous_close)
+                and (
+                    (zscore < 0 and close > previous_close)
+                    or (zscore > 0 and close < previous_close)
+                )
+            )
+            confirmation_count = int(
+                zscore_turn + return_turn + price_turn
+            )
+            crossback = bool(
+                was_armed
+                and np.isfinite(previous_zscore)
+                and self.mean_reversion_minimum_remaining_abs_zscore
+                <= abs(zscore)
+                <= self.mean_reversion_entry_abs_zscore
+                and zscore_turn
+            )
+            reversion_signal = bool(
+                self.allow_mean_reversion_entries
+                and valid
+                and regime == "MEAN_REVERSION"
+                and crossback
+                and (
+                    not self.require_mean_reversion_turn
+                    or confirmation_count >= self.minimum_reversion_confirmations
+                )
+            )
+            impulse = pd.to_numeric(row["Residual_Impulse"], errors="coerce")
+            momentum_signal = bool(
+                self.allow_momentum_entries and valid
+                and bool(row["Timestamp_Matched"])
+                and regime == "MOMENTUM"
+                and abs(zscore) >= self.momentum_minimum_abs_zscore
+                and np.isfinite(impulse)
+                and abs(impulse) > self.minimum_abs_impulse
+                and np.sign(zscore) == np.sign(impulse)
+            )
+            signal = "NO_TRADE"
+            if reversion_signal:
+                signal = expected_direction
+            elif momentum_signal:
+                signal = "BUY" if impulse > 0 else "SELL"
 
-        threshold = (
-            regime.eq("MOMENTUM")
-            & zscore.abs().ge(self.momentum_minimum_abs_zscore)
-        ) | (
-            regime.eq("MEAN_REVERSION")
-            & zscore.abs().ge(self.mean_reversion_minimum_abs_zscore)
-        )
-        reason = np.select([
-            ~result["Ranking_Validated"],
-            ~result["Timestamp_Matched"] & ~result["Ranking_Fallback_Used"],
-            result["Timestamp_Matched"] & ~result["Mathematical_Validated"],
-            ~threshold,
-            regime.eq("MOMENTUM") & (not self.allow_momentum_entries),
-            regime.eq("MEAN_REVERSION") & (
-                not self.allow_mean_reversion_entries
-            ),
-            regime.eq("MEAN_REVERSION") & ~reversion_turn,
-            regime.eq("MOMENTUM") & ~result["Timestamp_Matched"],
-            regime.eq("MOMENTUM") & ~momentum,
-            buy, sell,
-        ], [
-            "RANKING_VALIDATION_FAILED", "TIMESTAMP_MISMATCH",
-            "MATHEMATICAL_VALIDATION_FAILED", "ZSCORE_BELOW_SIGNAL_THRESHOLD",
-            "MOMENTUM_DISABLED", "MEAN_REVERSION_DISABLED",
-            "RESIDUAL_TURN_NOT_CONFIRMED",
-            "MOMENTUM_REQUIRES_EXACT_IMPULSE",
-            "MOMENTUM_IMPULSE_NOT_CONFIRMED", "BUY_SIGNAL", "SELL_SIGNAL",
-        ], default="NO_VALID_SIGNAL")
+            newly_armed = False
+            if signal in {"BUY", "SELL"}:
+                armed_direction = ""
+                armed_time = pd.NaT
+                armed_cycles = 0
+                maximum_abs_zscore = np.nan
+            elif valid and regime == "MEAN_REVERSION" \
+                    and abs(zscore) >= self.mean_reversion_arm_abs_zscore:
+                if armed_direction != expected_direction or pd.isna(armed_time):
+                    armed_direction = expected_direction
+                    armed_time = now
+                    armed_cycles = 1
+                    maximum_abs_zscore = abs(zscore)
+                    newly_armed = True
+                else:
+                    armed_cycles += 1
+                    maximum_abs_zscore = max(
+                        float(maximum_abs_zscore), abs(zscore)
+                    )
+            elif abs(zscore) < self.mean_reversion_minimum_remaining_abs_zscore:
+                armed_direction = ""
+                armed_time = pd.NaT
+                armed_cycles = 0
+                maximum_abs_zscore = np.nan
 
+            if signal == "BUY":
+                reason = "BUY_CROSSBACK_CONFIRMED"
+            elif signal == "SELL":
+                reason = "SELL_CROSSBACK_CONFIRMED"
+            elif not bool(row["Ranking_Validated"]):
+                reason = "RANKING_VALIDATION_FAILED"
+            elif not bool(row["Timestamp_Matched"]) \
+                    and not bool(row["Ranking_Fallback_Used"]):
+                reason = "TIMESTAMP_MISMATCH"
+            elif bool(row["Timestamp_Matched"]) \
+                    and not bool(row["Mathematical_Validated"]):
+                reason = "MATHEMATICAL_VALIDATION_FAILED"
+            elif regime == "MOMENTUM" and not self.allow_momentum_entries:
+                reason = "MOMENTUM_DISABLED"
+            elif regime == "MEAN_REVERSION" \
+                    and not self.allow_mean_reversion_entries:
+                reason = "MEAN_REVERSION_DISABLED"
+            elif expired:
+                reason = "ARMED_SIGNAL_EXPIRED"
+            elif newly_armed:
+                reason = "RESIDUAL_EXTREME_ARMED"
+            elif not was_armed:
+                reason = "WAITING_FOR_RESIDUAL_EXTREME"
+            elif not crossback:
+                reason = "WAITING_FOR_INWARD_CROSSBACK"
+            elif confirmation_count < self.minimum_reversion_confirmations:
+                reason = "INSUFFICIENT_REVERSAL_CONFIRMATIONS"
+            else:
+                reason = "NO_VALID_SIGNAL"
+
+            state_by_symbol[symbol] = {
+                "Symbol": symbol,
+                "Last_DateTime": now,
+                "Previous_ZScore": zscore,
+                "Maximum_Abs_ZScore": maximum_abs_zscore,
+                "Armed_Direction": armed_direction,
+                "Armed_DateTime": armed_time,
+                "Armed_Cycles": armed_cycles,
+                "Last_Rank": row["Rank"],
+                "Last_Regime": regime,
+                "Last_Selected_DateTime": now,
+                "Last_Signal_DateTime": (
+                    now if signal in {"BUY", "SELL"}
+                    else prior.get("Last_Signal_DateTime", pd.NaT)
+                ),
+            }
+            diagnostics.append({
+                "Previous_Residual_ZScore": previous_zscore,
+                "Signal_Armed": armed_direction in {"BUY", "SELL"},
+                "Armed_Direction": armed_direction,
+                "Armed_DateTime": armed_time,
+                "Armed_Age_Candles": armed_age,
+                "Maximum_Armed_Abs_ZScore": maximum_abs_zscore,
+                "ZScore_Turn_Confirmed": zscore_turn,
+                "Residual_Return_Confirmed": return_turn,
+                "Reversion_Confirmation_Count": confirmation_count,
+                "Reversion_Turn_Confirmed": (
+                    confirmation_count >= self.minimum_reversion_confirmations
+                ),
+                "Price_Turn_Confirmed": price_turn,
+                "Mathematical_Signal": signal,
+                "Signal_Direction": 1 if signal == "BUY" else -1 if signal == "SELL" else 0,
+                "Signal_Reason": reason,
+            })
+
+        diagnostic_frame = pd.DataFrame(diagnostics, index=result.index)
+        for column in diagnostic_frame:
+            result[column] = diagnostic_frame[column]
         strength = (
             self.mathematical_strength_weight * result["Mathematical_Score"]
             + self.cross_sectional_strength_weight * result["Cross_Sectional_Score"]
         ).clip(0.0, 100.0)
         dtype = np.float32 if self.memory_optimized else np.float64
         result["Signal_Eligible"] = validation.to_numpy(dtype=bool, copy=False)
-        result["Previous_Residual_ZScore"] = previous_zscore.astype(
-            dtype, copy=False
-        )
-        result["Reversion_Turn_Confirmed"] = reversion_turn.to_numpy(
-            dtype=bool, copy=False
-        )
         result["Mathematical_Signal"] = pd.Categorical(
-            signal, categories=["NO_TRADE", "BUY", "SELL"]
+            result["Mathematical_Signal"], categories=["NO_TRADE", "BUY", "SELL"]
         )
-        result["Signal_Direction"] = np.select(
-            [buy, sell], [1, -1], default=0
-        ).astype(np.int8)
+        result["Signal_Direction"] = result["Signal_Direction"].astype(np.int8)
         result["Signal_Strength"] = strength.where(
-            signal != "NO_TRADE", np.nan
+            result["Mathematical_Signal"].astype("string") != "NO_TRADE",
+            np.nan,
         ).astype(dtype, copy=False)
-        result["Signal_Reason"] = pd.Categorical(reason)
+        result["Signal_Reason"] = pd.Categorical(result["Signal_Reason"])
         result["Calculation_Backend"] = self.calculation_backend
-        return result
+        updated_state = pd.DataFrame(
+            state_by_symbol.values(), columns=self.STATE_COLUMNS
+        )
+        updated_state.sort_values("Symbol", inplace=True)
+        updated_state.reset_index(drop=True, inplace=True)
+        return result, updated_state
 
     @staticmethod
     def _excel_safe(frame):
@@ -478,7 +773,7 @@ class FiveMinuteMathematicalSignalEngine:
                     for row in range(2, sheet.max_row + 1):
                         sheet.cell(row, column).number_format = "0.0000"
 
-    def _save(self, report, output_file):
+    def _save(self, report, state, output_file):
         output_path = Path(output_file).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         actionable = report.loc[
@@ -496,7 +791,8 @@ class FiveMinuteMathematicalSignalEngine:
             "Metric": [
                 "Decision Timestamp", "Selected Shares Processed", "BUY Signals",
                 "SELL Signals", "NO_TRADE Signals", "Exact Validations",
-                "Ranking Snapshot Fallbacks", "Calculation Backend",
+                "Ranking Snapshot Fallbacks", "Armed Symbols",
+                "Calculation Backend",
             ],
             "Value": [
                 decision_timestamp, len(report),
@@ -504,7 +800,9 @@ class FiveMinuteMathematicalSignalEngine:
                 int(report["Mathematical_Signal"].eq("SELL").sum()),
                 int(report["Mathematical_Signal"].eq("NO_TRADE").sum()),
                 int(report["Mathematical_Validated"].sum()),
-                int(report["Ranking_Fallback_Used"].sum()), self.calculation_backend,
+                int(report["Ranking_Fallback_Used"].sum()),
+                int(state["Armed_Direction"].isin(["BUY", "SELL"]).sum()),
+                self.calculation_backend,
             ],
         })
         descriptor, temporary = tempfile.mkstemp(
@@ -523,6 +821,9 @@ class FiveMinuteMathematicalSignalEngine:
                 self._excel_safe(issues).to_excel(
                     writer, sheet_name="Validation_Issues", index=False
                 )
+                self._excel_safe(state).to_excel(
+                    writer, sheet_name="Signal_State_Snapshot", index=False
+                )
                 self._style(writer)
             os.replace(temporary, output_path)
         except Exception:
@@ -536,13 +837,16 @@ class FiveMinuteMathematicalSignalEngine:
     ):
         ranking = self._load_ranking(ranking_file or self.ranking_file)
         selected_symbols = ranking["Symbol"].tolist()
+        state = self._load_signal_state()
 
         if selected_symbols:
             mathematical = self._load_mathematical(
                 mathematical_score_file or self.mathematical_score_file,
                 selected_symbols,
             )
-            calculated = self._signals(self._combine(ranking, mathematical))
+            calculated, state = self._signals(
+                self._combine(ranking, mathematical), state
+            )
             report = calculated.reindex(columns=self.OUTPUT_COLUMNS).copy()
             report.sort_values(["Rank", "Symbol"], inplace=True)
             report.reset_index(drop=True, inplace=True)
@@ -563,8 +867,9 @@ class FiveMinuteMathematicalSignalEngine:
 
         selected_output = output_file or self.output_file
         saved = None
+        state_saved = self._save_signal_state(state)
         if self.save_excel_enabled and selected_output:
-            saved = self._save(report, selected_output)
+            saved = self._save(report, state, selected_output)
         actionable = report["Mathematical_Signal"].astype("string").isin(
             ["BUY", "SELL"]
         )
@@ -582,6 +887,7 @@ class FiveMinuteMathematicalSignalEngine:
         )
         report.attrs["Selected_Symbols"] = selected_symbols
         report.attrs["Excel_File"] = saved
+        report.attrs["Signal_State_File"] = state_saved
         print("=" * 120)
         print("FMRSS : SELECTED-SHARE MATHEMATICAL SIGNALS")
         print("=" * 120)

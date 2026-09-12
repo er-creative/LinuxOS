@@ -58,6 +58,10 @@ class FiveMinuteRiskEngine:
         "Potential_Profit",
         "Estimated_Round_Trip_Cost",
         "Expected_Profit_Cost_Multiple",
+        "Expected_Net_Profit",
+        "Expected_Net_Reward_Risk",
+        "Benchmark_Return",
+        "Benchmark_Trend",
         "Portfolio_Exposure_After",
         "Trade_Approved",
         "Risk_Decision_Reason",
@@ -78,6 +82,7 @@ class FiveMinuteRiskEngine:
         maximum_allocation_per_trade=0.20,
         maximum_portfolio_exposure=0.80,
         maximum_open_positions=2,
+        maximum_entry_rank=2,
         maximum_signal_age_minutes=5.0,
         atr_window=14,
         atr_history_rows=80,
@@ -90,7 +95,12 @@ class FiveMinuteRiskEngine:
         minimum_price=1.0,
         estimated_transaction_cost_rate=0.0003,
         estimated_slippage_rate=0.0001,
-        minimum_expected_profit_cost_multiple=3.0,
+        minimum_expected_profit_cost_multiple=4.0,
+        minimum_expected_net_reward_risk=1.25,
+        benchmark_filename="NIFTY%2050_5mins.txt",
+        enable_benchmark_trend_filter=True,
+        benchmark_trend_candles=6,
+        maximum_adverse_benchmark_return=0.002,
         allow_momentum_entries=False,
         maximum_ledger_rows=5000,
         memory_optimized=True,
@@ -112,15 +122,25 @@ class FiveMinuteRiskEngine:
             "minimum_expected_profit_cost_multiple",
             minimum_expected_profit_cost_multiple,
         )
+        self._positive(
+            "minimum_expected_net_reward_risk",
+            minimum_expected_net_reward_risk,
+        )
+        self._positive(
+            "maximum_adverse_benchmark_return",
+            maximum_adverse_benchmark_return,
+        )
         if minimum_stop_percent >= maximum_stop_percent:
             raise ValueError(
                 "minimum_stop_percent must be less than maximum_stop_percent"
             )
         for name, value in {
             "maximum_open_positions": maximum_open_positions,
+            "maximum_entry_rank": maximum_entry_rank,
             "atr_window": atr_window,
             "atr_history_rows": atr_history_rows,
             "maximum_ledger_rows": maximum_ledger_rows,
+            "benchmark_trend_candles": benchmark_trend_candles,
         }.items():
             if not isinstance(value, (int, np.integer)) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -136,6 +156,7 @@ class FiveMinuteRiskEngine:
         self.maximum_allocation_per_trade = float(maximum_allocation_per_trade)
         self.maximum_portfolio_exposure = float(maximum_portfolio_exposure)
         self.maximum_open_positions = int(maximum_open_positions)
+        self.maximum_entry_rank = int(maximum_entry_rank)
         self.maximum_signal_age_minutes = float(maximum_signal_age_minutes)
         self.atr_window = int(atr_window)
         self.atr_history_rows = int(atr_history_rows)
@@ -156,6 +177,17 @@ class FiveMinuteRiskEngine:
         self.estimated_slippage_rate = float(estimated_slippage_rate)
         self.minimum_expected_profit_cost_multiple = float(
             minimum_expected_profit_cost_multiple
+        )
+        self.minimum_expected_net_reward_risk = float(
+            minimum_expected_net_reward_risk
+        )
+        self.benchmark_filename = str(benchmark_filename)
+        self.enable_benchmark_trend_filter = bool(
+            enable_benchmark_trend_filter
+        )
+        self.benchmark_trend_candles = int(benchmark_trend_candles)
+        self.maximum_adverse_benchmark_return = float(
+            maximum_adverse_benchmark_return
         )
         self.allow_momentum_entries = bool(allow_momentum_entries)
         self.maximum_ledger_rows = int(maximum_ledger_rows)
@@ -275,6 +307,31 @@ class FiveMinuteRiskEngine:
         del frame, previous_close, true_range
         return result
 
+    def _benchmark_snapshot(self):
+        """Read only the NIFTY tail required by the directional risk gate."""
+        if not self.enable_benchmark_trend_filter:
+            return {"Benchmark_Return": 0.0, "Benchmark_Trend": "DISABLED"}
+        symbol = self.benchmark_filename
+        suffix = "_5mins.txt"
+        if symbol.endswith(suffix):
+            symbol = symbol[:-len(suffix)]
+        frame = self._read_tail(symbol)
+        closes = frame["Close"].tail(self.benchmark_trend_candles + 1)
+        if len(closes) < self.benchmark_trend_candles + 1:
+            raise ValueError("insufficient NIFTY candles for trend filter")
+        benchmark_return = float(closes.iloc[-1] / closes.iloc[0] - 1.0)
+        threshold = self.maximum_adverse_benchmark_return
+        trend = (
+            "STRONGLY_BULLISH" if benchmark_return >= threshold
+            else "STRONGLY_BEARISH" if benchmark_return <= -threshold
+            else "NEUTRAL"
+        )
+        del frame, closes
+        return {
+            "Benchmark_Return": benchmark_return,
+            "Benchmark_Trend": trend,
+        }
+
     def _blank_decision(self, row):
         decision_time = row.Decision_DateTime
         symbol = row.Symbol
@@ -306,6 +363,10 @@ class FiveMinuteRiskEngine:
             "Potential_Profit": 0.0,
             "Estimated_Round_Trip_Cost": 0.0,
             "Expected_Profit_Cost_Multiple": np.nan,
+            "Expected_Net_Profit": np.nan,
+            "Expected_Net_Reward_Risk": np.nan,
+            "Benchmark_Return": np.nan,
+            "Benchmark_Trend": "NOT_EVALUATED",
             "Portfolio_Exposure_After": np.nan,
             "Trade_Approved": False,
             "Risk_Decision_Reason": "NOT_EVALUATED",
@@ -317,12 +378,14 @@ class FiveMinuteRiskEngine:
         decisions = []
         used_exposure = 0.0
         approved_positions = 0
+        benchmark = self._benchmark_snapshot()
 
         for row in signals.itertuples(index=False):
             item = self._blank_decision(row)
             try:
                 snapshot = self._market_snapshot(row.Symbol)
                 item.update(snapshot)
+                item.update(benchmark)
                 entry = snapshot["Entry_Price"]
                 atr = snapshot["ATR_14"]
                 market_time = snapshot["Market_DateTime"]
@@ -343,6 +406,20 @@ class FiveMinuteRiskEngine:
                     rejection = "INVALID_REGIME"
                 elif row.Regime == "MOMENTUM" and not self.allow_momentum_entries:
                     rejection = "MOMENTUM_DISABLED"
+                elif (
+                    self.enable_benchmark_trend_filter
+                    and row.Mathematical_Signal in {"SELL", "SELL_SHORT"}
+                    and benchmark["Benchmark_Trend"] == "STRONGLY_BULLISH"
+                ):
+                    rejection = "SHORT_BLOCKED_BY_NIFTY_UPTREND"
+                elif (
+                    self.enable_benchmark_trend_filter
+                    and row.Mathematical_Signal == "BUY"
+                    and benchmark["Benchmark_Trend"] == "STRONGLY_BEARISH"
+                ):
+                    rejection = "BUY_BLOCKED_BY_NIFTY_DOWNTREND"
+                elif not np.isfinite(row.Rank) or row.Rank > self.maximum_entry_rank:
+                    rejection = "OUTSIDE_ENTRY_RANK_LIMIT"
                 elif pd.isna(source_time) or not np.isfinite(age):
                     rejection = "INVALID_SIGNAL_TIMESTAMP"
                 elif age < 0:
@@ -417,6 +494,11 @@ class FiveMinuteRiskEngine:
                 profit_cost_multiple = potential_profit / max(
                     estimated_cost, 1e-12
                 )
+                expected_net_profit = potential_profit - estimated_cost
+                expected_net_loss = maximum_loss + estimated_cost
+                expected_net_reward_risk = expected_net_profit / max(
+                    expected_net_loss, 1e-12
+                )
                 if (
                     profit_cost_multiple
                     < self.minimum_expected_profit_cost_multiple
@@ -428,7 +510,23 @@ class FiveMinuteRiskEngine:
                         "Potential_Profit": potential_profit,
                         "Estimated_Round_Trip_Cost": estimated_cost,
                         "Expected_Profit_Cost_Multiple": profit_cost_multiple,
+                        "Expected_Net_Profit": expected_net_profit,
+                        "Expected_Net_Reward_Risk": expected_net_reward_risk,
                         "Risk_Decision_Reason": "EXPECTED_PROFIT_TOO_SMALL_FOR_COST",
+                    })
+                    decisions.append(item)
+                    continue
+                if expected_net_reward_risk < self.minimum_expected_net_reward_risk:
+                    item.update({
+                        "Quantity": quantity,
+                        "Planned_Notional": notional,
+                        "Maximum_Loss": maximum_loss,
+                        "Potential_Profit": potential_profit,
+                        "Estimated_Round_Trip_Cost": estimated_cost,
+                        "Expected_Profit_Cost_Multiple": profit_cost_multiple,
+                        "Expected_Net_Profit": expected_net_profit,
+                        "Expected_Net_Reward_Risk": expected_net_reward_risk,
+                        "Risk_Decision_Reason": "NET_REWARD_RISK_TOO_LOW",
                     })
                     decisions.append(item)
                     continue
@@ -450,6 +548,8 @@ class FiveMinuteRiskEngine:
                         "Potential_Profit": potential_profit,
                         "Estimated_Round_Trip_Cost": estimated_cost,
                         "Expected_Profit_Cost_Multiple": profit_cost_multiple,
+                        "Expected_Net_Profit": expected_net_profit,
+                        "Expected_Net_Reward_Risk": expected_net_reward_risk,
                         "Portfolio_Exposure_After": (
                             used_exposure / self.initial_capital
                         ),

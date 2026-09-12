@@ -18,10 +18,18 @@ class FiveMinuteMathematicalScoreEngine:
         "Residual_Return",
         "Residual_Impulse",
         "Residual_ZScore",
+        "Residual_Level",
+        "Residual_Fair_Value",
+        "Expected_Reversion_Return",
         "Residual_Features_Ready",
         "Stable_Regime",
         "Regime_Stable",
         "Regime_Strength",
+        "Residual_Half_Life",
+        "Residual_Zero_Crossings",
+        "Residual_Variance_Ratio",
+        "Residual_Stationary",
+        "Residual_Quality_Score",
         "Volume_Factor",
         "Volume_Confirmation_Ready",
         "Volume_Confirmed",
@@ -49,6 +57,10 @@ class FiveMinuteMathematicalScoreEngine:
         momentum_consistency_window=5,
         reversion_consistency_window=3,
         minimum_mathematical_score=65.0,
+        minimum_residual_quality_score=50.0,
+        minimum_expected_move_percent=0.30,
+        estimated_round_trip_cost_percent=0.11,
+        minimum_edge_to_cost_ratio=2.0,
         weight_tolerance=1e-9,
         memory_optimized=True,
         report_output_file=(
@@ -113,6 +125,14 @@ class FiveMinuteMathematicalScoreEngine:
             raise ValueError(
                 "minimum_mathematical_score must be between 0 and 100"
             )
+        if not 0 <= minimum_residual_quality_score <= 100:
+            raise ValueError("minimum_residual_quality_score must be 0..100")
+        if minimum_expected_move_percent < 0:
+            raise ValueError("minimum_expected_move_percent cannot be negative")
+        if estimated_round_trip_cost_percent < 0:
+            raise ValueError("estimated_round_trip_cost_percent cannot be negative")
+        if minimum_edge_to_cost_ratio < 1:
+            raise ValueError("minimum_edge_to_cost_ratio must be at least 1")
 
         self.residual_weight = float(
             residual_weight
@@ -149,6 +169,12 @@ class FiveMinuteMathematicalScoreEngine:
         self.minimum_mathematical_score = float(
             minimum_mathematical_score
         )
+        self.minimum_residual_quality_score = float(minimum_residual_quality_score)
+        self.minimum_expected_move_percent = float(minimum_expected_move_percent)
+        self.estimated_round_trip_cost_percent = float(
+            estimated_round_trip_cost_percent
+        )
+        self.minimum_edge_to_cost_ratio = float(minimum_edge_to_cost_ratio)
 
         self.memory_optimized = bool(memory_optimized)
         self.report_output_file = (
@@ -223,7 +249,14 @@ class FiveMinuteMathematicalScoreEngine:
             "Residual_Impulse",
             "Residual_ZScore",
             "Regime_Strength",
-            "Volume_Factor"
+            "Volume_Factor",
+            "Residual_Level",
+            "Residual_Fair_Value",
+            "Expected_Reversion_Return",
+            "Residual_Half_Life",
+            "Residual_Zero_Crossings",
+            "Residual_Variance_Ratio",
+            "Residual_Quality_Score",
         ]
 
         for column in numeric_columns:
@@ -247,6 +280,7 @@ class FiveMinuteMathematicalScoreEngine:
             "Volume_Confirmed",
             "Volatility_Features_Ready",
             "Volatility_Eligible"
+            ,"Residual_Stationary"
         ]
 
         for column in boolean_columns:
@@ -358,6 +392,21 @@ class FiveMinuteMathematicalScoreEngine:
             score_dtype,
             copy=False
         )
+        df["Residual_Quality_Score"] = df["Residual_Quality_Score"].clip(
+            lower=0.0, upper=100.0
+        ).astype(score_dtype, copy=False)
+        expected_percent = 100.0 * df["Expected_Reversion_Return"].abs()
+        required_percent = max(
+            self.minimum_expected_move_percent,
+            self.estimated_round_trip_cost_percent * self.minimum_edge_to_cost_ratio,
+        )
+        df["Expected_Move_Percent"] = expected_percent.astype(
+            score_dtype, copy=False
+        )
+        df["Required_Move_Percent"] = np.float32(required_percent)
+        df["Edge_To_Cost_Ratio"] = (
+            expected_percent / max(self.estimated_round_trip_cost_percent, 1e-9)
+        ).astype(score_dtype, copy=False)
 
         return df
 
@@ -485,13 +534,25 @@ class FiveMinuteMathematicalScoreEngine:
             .where(movement_toward_zero.notna())
         )
 
-        reversion_consistency = (
+        recent_turn_consistency = (
             improvement_indicator
             .rolling(
                 window=self.reversion_consistency_window,
                 min_periods=self.reversion_consistency_window
             )
             .mean()
+        )
+
+        # Structural residual quality is the stable part of a reversion
+        # setup.  A recent turn is useful, but the Signal Engine confirms it
+        # again on the entry candle; requiring three perfect falling-Z bars
+        # here rejected otherwise valid candidates before they could turn.
+        quality_consistency = (
+            df["Residual_Quality_Score"].clip(0.0, 100.0) / 100.0
+        )
+        reversion_consistency = (
+            0.70 * quality_consistency
+            + 0.30 * recent_turn_consistency.fillna(0.0)
         )
 
         df["Reversion_Consistency"] = (
@@ -584,6 +645,11 @@ class FiveMinuteMathematicalScoreEngine:
             + self.consistency_weight
             * df["Consistency_Score"]
         )
+        # Quality is a reliability multiplier, not another freely tunable
+        # weight. A large Z-score from a poor residual process is discounted.
+        mathematical_score = mathematical_score * (
+            0.50 + 0.50 * df["Residual_Quality_Score"].clip(0, 100) / 100.0
+        )
 
         df["Score_Features_Ready"] = score_features_ready
 
@@ -630,12 +696,22 @@ class FiveMinuteMathematicalScoreEngine:
             df["Mathematical_Score"]
             >= self.minimum_mathematical_score
         )
+        residual_quality_accepted = (
+            df["Residual_Stationary"]
+            & df["Residual_Quality_Score"].ge(self.minimum_residual_quality_score)
+        )
+        economic_edge_accepted = (
+            df["Expected_Move_Percent"].ge(df["Required_Move_Percent"])
+            & df["Edge_To_Cost_Ratio"].ge(self.minimum_edge_to_cost_ratio)
+        )
 
         df["Mathematical_Setup_Ready"] = setup_ready
 
         df["Mathematical_Setup_Accepted"] = (
             setup_ready
             & score_accepted
+            & residual_quality_accepted
+            & economic_edge_accepted
         )
 
         reason = np.select(
@@ -650,6 +726,8 @@ class FiveMinuteMathematicalScoreEngine:
                 ~df["Volatility_Eligible"],
                 ~df["Consistency_Features_Ready"],
                 ~df["Score_Features_Ready"],
+                ~residual_quality_accepted,
+                ~economic_edge_accepted,
                 ~score_accepted
             ],
             choicelist=[
@@ -663,6 +741,8 @@ class FiveMinuteMathematicalScoreEngine:
                 "VOLATILITY_NOT_ELIGIBLE",
                 "CONSISTENCY_NOT_READY",
                 "SCORE_NOT_READY",
+                "RESIDUAL_QUALITY_FAILED",
+                "INSUFFICIENT_EXPECTED_EDGE_AFTER_COST",
                 "LOW_MATHEMATICAL_SCORE"
             ],
             default="ACCEPTED"
@@ -734,6 +814,22 @@ class FiveMinuteMathematicalScoreEngine:
             "Latest_Residual_Return": latest["Residual_Return"],
             "Latest_Residual_Impulse": latest["Residual_Impulse"],
             "Latest_Residual_ZScore": latest["Residual_ZScore"],
+            "Latest_Close": latest.get("Close", np.nan),
+            "Latest_Previous_Close": (
+                df["Close"].shift(1).iloc[-1] if "Close" in df else np.nan
+            ),
+            "Latest_Price_Return": (
+                df["Close"].pct_change().iloc[-1] if "Close" in df else np.nan
+            ),
+            "Latest_Residual_Fair_Value": latest["Residual_Fair_Value"],
+            "Latest_Expected_Reversion_Return": latest["Expected_Reversion_Return"],
+            "Latest_Expected_Move_Percent": latest["Expected_Move_Percent"],
+            "Latest_Edge_To_Cost_Ratio": latest["Edge_To_Cost_Ratio"],
+            "Latest_Residual_Half_Life": latest["Residual_Half_Life"],
+            "Latest_Residual_Zero_Crossings": latest["Residual_Zero_Crossings"],
+            "Latest_Residual_Variance_Ratio": latest["Residual_Variance_Ratio"],
+            "Latest_Residual_Stationary": bool(latest["Residual_Stationary"]),
+            "Latest_Residual_Quality_Score": latest["Residual_Quality_Score"],
             "Latest_Regime_Strength": latest["Regime_Strength"],
             "Latest_Volume_Factor": latest["Volume_Factor"],
             "Latest_Momentum_Direction": str(

@@ -1,8 +1,60 @@
-
 python -u FiveMinuteForwardTestPhaseA.py \
-    --interval-seconds 20
+    --tests-folder /home/devinderjeet/fmrss/tests \
+    --data-mode synthetic \
+    --interval-seconds 20 \
+    --run-first-cycle-in-foreground \ 
+    --require-cython
+
     
 python -u FiveMinuteForwardTestPhaseB.py \
+    --tests-folder /home/devinderjeet/fmrss/tests \
     --poll-seconds 20 \
-    --maximum-signal-age-minutes 180 \
+    --maximum-signal-age-minutes 15 \
+    --maximum-open-positions 2\
+    --mean-reversion-arm-zscore 2.50 \
+    --mean-reversion-entry-zscore 2.20 \
+    --mean-reversion-minimum-zscore 1.50 \
+    --minimum-reversion-confirmations 2 \
+    --maximum-armed-age-candles 12
+
+
+python -u FiveMinuteForwardTestPhaseB.py \
+    --tests-folder /home/devinderjeet/fmrss/tests_live \
+    --market-data-folder /home/hadoop/shareMarket_Data \
+    --poll-seconds 20 \
+    --maximum-signal-age-minutes 15 \
+    --maximum-open-positions 2 \
+    --mean-reversion-arm-zscore 2.50 \
+    --mean-reversion-entry-zscore 2.20 \
+    --mean-reversion-minimum-zscore 1.50 \
+    --minimum-reversion-confirmations 2 \
+    --maximum-armed-age-candles 12
+
+-------------------------
+Paper trading
+------------------------
+python -u FiveMinuteForwardTestPhaseA.py \
+    --data-mode live \
+    --source-data-folder /home/hadoop/shareMarket_Data \
+    --tests-folder /home/devinderjeet/fmrss/tests_live \
+    --interval-seconds 20 \
+    --run-first-cycle-in-foreground
+    
+python -u FiveMinuteForwardTestPhaseB.py \
+    --tests-folder /home/devinderjeet/fmrss/tests_live \
+    --market-data-folder /home/hadoop/shareMarket_Data \
+    --poll-seconds 1 \
+    --maximum-signal-age-minutes 15 \
     --maximum-open-positions 2
+
+python -u FiveMinuteForwardTestPhaseB.py \
+    --tests-folder /home/devinderjeet/fmrss/tests_live \
+    --market-data-folder /home/hadoop/shareMarket_Data \
+    --poll-seconds 20 \
+    --maximum-signal-age-minutes 15 \
+    --maximum-open-positions 2 \
+    --mean-reversion-arm-zscore 2.50 \
+    --mean-reversion-entry-zscore 2.20 \
+    --mean-reversion-minimum-zscore 1.50 \
+    --minimum-reversion-confirmations 2 \
+    --maximum-armed-age-candles 12

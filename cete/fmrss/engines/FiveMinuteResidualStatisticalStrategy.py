@@ -30,7 +30,10 @@ class FiveMinuteResidualStatisticalStrategy:
 
     MATHEMATICAL_COLUMNS = [
         "Symbol", "Latest_DateTime", "Latest_Stable_Regime",
-        "Latest_Residual_ZScore", "Latest_Setup_Ready",
+        "Latest_Residual_ZScore", "Latest_Residual_Return",
+        "Latest_Residual_Stationary", "Latest_Residual_Quality_Score",
+        "Latest_Close", "Latest_Previous_Close",
+        "Latest_Setup_Ready", "Latest_Setup_Accepted",
     ]
 
     POSITION_COLUMNS = [
@@ -62,6 +65,14 @@ class FiveMinuteResidualStatisticalStrategy:
         "Price", "Quantity", "Reason",
     ]
 
+    MANUAL_LEDGER_COLUMNS = [
+        "Trade_ID", "Symbol", "Entry_Action", "Regime", "Rank",
+        "Entry_Time", "Entry_Price", "Stop_Loss", "Target_Price",
+        "Quantity", "Status", "Current_Price", "Exit_Time", "Exit_Price",
+        "Exit_Reason", "Gross_PnL", "Total_Trading_Cost", "Net_PnL",
+        "Portfolio_Value", "Manual_Exit_Price",
+    ]
+
     def __init__(
         self,
         trading_ledger_file=(
@@ -73,6 +84,8 @@ class FiveMinuteResidualStatisticalStrategy:
             "/home/devinderjeet/fmrss/report/"
             "ResidualStatisticalStrategy.xlsx"
         ),
+        manual_ledger_file=None,
+        position_journal_file=None,
         approved_sheet="Approved_Trades",
         initial_capital=100000.0,
         maximum_open_positions=2,
@@ -92,14 +105,23 @@ class FiveMinuteResidualStatisticalStrategy:
         trailing_lock_r=0.50,
         trailing_distance_r=0.50,
         force_exit_at_session_end=True,
-        session_exit_time="15:15",
+        session_exit_time="15:14",
         exit_when_risk_approval_removed=False,
         entry_confirmation_cycles=1,
+        maximum_entry_rank=2,
+        maximum_entry_age_minutes=5.0,
+        minimum_entry_abs_zscore=2.50,
+        maximum_entry_abs_zscore=None,
+        minimum_residual_quality_score=50.0,
+        maximum_entry_deviation_atr=0.20,
         reversal_confirmation_cycles=2,
         reentry_cooldown_candles=6,
         stop_loss_cooldown_candles=12,
         mean_reversion_normalization_zscore=0.50,
+        require_profitable_residual_normalization=True,
+        minimum_normalization_net_pnl=0.0,
         residual_adverse_expansion=0.75,
+        exit_on_residual_divergence=False,
         maximum_consecutive_losses=3,
         daily_loss_limit_fraction=0.01,
         mean_reversion_maximum_holding_candles=12,
@@ -157,6 +179,7 @@ class FiveMinuteResidualStatisticalStrategy:
             raise ValueError("market_tail_rows must be positive")
         for name, value in {
             "entry_confirmation_cycles": entry_confirmation_cycles,
+            "maximum_entry_rank": maximum_entry_rank,
             "reversal_confirmation_cycles": reversal_confirmation_cycles,
             "reentry_cooldown_candles": reentry_cooldown_candles,
             "stop_loss_cooldown_candles": stop_loss_cooldown_candles,
@@ -170,6 +193,21 @@ class FiveMinuteResidualStatisticalStrategy:
                 raise ValueError(f"{name} must be a non-negative integer")
         if entry_confirmation_cycles < 1 or reversal_confirmation_cycles < 1:
             raise ValueError("confirmation cycles must be at least 1")
+        for name, value in {
+            "maximum_entry_age_minutes": maximum_entry_age_minutes,
+            "minimum_entry_abs_zscore": minimum_entry_abs_zscore,
+            "minimum_residual_quality_score": minimum_residual_quality_score,
+            "maximum_entry_deviation_atr": maximum_entry_deviation_atr,
+        }.items():
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if maximum_entry_abs_zscore is not None and (
+            not np.isfinite(maximum_entry_abs_zscore)
+            or maximum_entry_abs_zscore < 0
+        ):
+            raise ValueError(
+                "maximum_entry_abs_zscore must be finite and non-negative"
+            )
         if not np.isfinite(mean_reversion_normalization_zscore) \
                 or mean_reversion_normalization_zscore < 0:
             raise ValueError(
@@ -182,6 +220,12 @@ class FiveMinuteResidualStatisticalStrategy:
         )
         self.data_folder = str(data_folder)
         self.output_file = str(output_file)
+        self.manual_ledger_file = (
+            str(manual_ledger_file) if manual_ledger_file else None
+        )
+        self.position_journal_file = (
+            str(position_journal_file) if position_journal_file else None
+        )
         self.approved_sheet = str(approved_sheet)
         self.initial_capital = float(initial_capital)
         self.maximum_open_positions = int(maximum_open_positions)
@@ -218,11 +262,36 @@ class FiveMinuteResidualStatisticalStrategy:
             exit_when_risk_approval_removed
         )
         self.entry_confirmation_cycles = int(entry_confirmation_cycles)
+        self.maximum_entry_rank = int(maximum_entry_rank)
+        self.maximum_entry_age_minutes = float(maximum_entry_age_minutes)
+        self.minimum_entry_abs_zscore = float(minimum_entry_abs_zscore)
+        self.maximum_entry_abs_zscore = (
+            float(maximum_entry_abs_zscore)
+            if maximum_entry_abs_zscore is not None
+            else float("inf")
+        )
+        if self.maximum_entry_abs_zscore < self.minimum_entry_abs_zscore:
+            raise ValueError(
+                "maximum_entry_abs_zscore must be greater than or equal to "
+                "minimum_entry_abs_zscore"
+            )
+        self.minimum_residual_quality_score = float(
+            minimum_residual_quality_score
+        )
+        self.maximum_entry_deviation_atr = float(maximum_entry_deviation_atr)
         self.reversal_confirmation_cycles = int(reversal_confirmation_cycles)
         self.reentry_cooldown_candles = int(reentry_cooldown_candles)
         self.stop_loss_cooldown_candles = int(stop_loss_cooldown_candles)
         self.mean_reversion_normalization_zscore = float(
             mean_reversion_normalization_zscore
+        )
+        if not np.isfinite(minimum_normalization_net_pnl):
+            raise ValueError("minimum_normalization_net_pnl must be finite")
+        self.require_profitable_residual_normalization = bool(
+            require_profitable_residual_normalization
+        )
+        self.minimum_normalization_net_pnl = float(
+            minimum_normalization_net_pnl
         )
         if not np.isfinite(residual_adverse_expansion) \
                 or residual_adverse_expansion <= 0:
@@ -231,6 +300,9 @@ class FiveMinuteResidualStatisticalStrategy:
                 or not 0 < daily_loss_limit_fraction <= 0.10:
             raise ValueError("daily_loss_limit_fraction must be in (0, 0.10]")
         self.residual_adverse_expansion = float(residual_adverse_expansion)
+        self.exit_on_residual_divergence = bool(
+            exit_on_residual_divergence
+        )
         self.maximum_consecutive_losses = int(maximum_consecutive_losses)
         self.daily_loss_limit_fraction = float(daily_loss_limit_fraction)
         self.mean_reversion_maximum_holding_candles = int(
@@ -256,7 +328,9 @@ class FiveMinuteResidualStatisticalStrategy:
         self.realized_pnl = 0.0
         self.equity = self.initial_capital
         self.cycle_number = 0
-        self._restore_state()
+        restored = self._restore_state()
+        if not restored:
+            self._restore_position_journal()
 
     @staticmethod
     def _parse_time(value):
@@ -362,9 +436,16 @@ class FiveMinuteResidualStatisticalStrategy:
         frame["Latest_Residual_ZScore"] = pd.to_numeric(
             frame["Latest_Residual_ZScore"], errors="coerce"
         )
-        frame["Latest_Setup_Ready"] = self._boolean(
-            frame["Latest_Setup_Ready"]
-        )
+        for column in [
+            "Latest_Residual_Return", "Latest_Residual_Quality_Score",
+            "Latest_Close", "Latest_Previous_Close",
+        ]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        for column in [
+            "Latest_Residual_Stationary", "Latest_Setup_Ready",
+            "Latest_Setup_Accepted",
+        ]:
+            frame[column] = self._boolean(frame[column])
         frame.drop_duplicates("Symbol", keep="last", inplace=True)
         return {
             row.Symbol: row for row in frame.itertuples(index=False)
@@ -460,7 +541,7 @@ class FiveMinuteResidualStatisticalStrategy:
 
     def _restore_state(self):
         if not os.path.isfile(self.output_file):
-            return
+            return False
         try:
             open_frame = pd.read_excel(
                 self.output_file, sheet_name="Open_Positions", engine="openpyxl"
@@ -531,11 +612,124 @@ class FiveMinuteResidualStatisticalStrategy:
             if not self.events.empty:
                 cycles = pd.to_numeric(self.events["Cycle"], errors="coerce")
                 self.cycle_number = int(cycles.max()) if cycles.notna().any() else 0
+            return True
         except (ValueError, OSError):
             # An unrelated/legacy workbook is not valid strategy state.
             self.open_positions = pd.DataFrame(columns=self.POSITION_COLUMNS)
             self.closed_trades = pd.DataFrame(columns=self.TRADE_COLUMNS)
             self.events = pd.DataFrame(columns=self.EVENT_COLUMNS)
+            return False
+
+    def _restore_position_journal(self):
+        """Recover execution state when disposable report files were removed."""
+        if not self.position_journal_file \
+                or not os.path.isfile(self.position_journal_file):
+            return False
+        try:
+            open_frame = pd.read_excel(
+                self.position_journal_file,
+                sheet_name="Open_Positions",
+                engine="openpyxl",
+            ).reindex(columns=self.POSITION_COLUMNS)
+            closed_frame = pd.read_excel(
+                self.position_journal_file,
+                sheet_name="Closed_Trades",
+                engine="openpyxl",
+            ).reindex(columns=self.TRADE_COLUMNS)
+            event_frame = pd.read_excel(
+                self.position_journal_file,
+                sheet_name="Event_Log",
+                engine="openpyxl",
+            ).reindex(columns=self.EVENT_COLUMNS)
+            metadata = pd.read_excel(
+                self.position_journal_file,
+                sheet_name="Recovery_Metadata",
+                engine="openpyxl",
+            )
+
+            self.open_positions = open_frame
+            for column in [
+                "Entry_Time", "Last_Checked_DateTime"
+            ]:
+                self.open_positions[column] = pd.to_datetime(
+                    self.open_positions[column], errors="coerce"
+                )
+            for column in [
+                "Direction", "Quantity", "Entry_Confirmation_Count",
+                "Reversal_Confirmation_Count", "Candles_Held",
+            ]:
+                self.open_positions[column] = pd.to_numeric(
+                    self.open_positions[column], errors="coerce"
+                ).fillna(0).astype(np.int32)
+            for column in [
+                "Entry_Price", "Entry_Market_Price",
+                "Entry_Residual_ZScore", "Stop_Loss", "Target_Price",
+                "Reward_Risk_Ratio", "Initial_Risk", "Initial_Stop_Loss",
+                "Highest_Price_Since_Entry", "Lowest_Price_Since_Entry",
+                "Maximum_Favorable_Excursion", "Estimated_Exit_Charges",
+                "Estimated_Net_PnL", "Current_Price", "Unrealized_PnL",
+            ]:
+                self.open_positions[column] = pd.to_numeric(
+                    self.open_positions[column], errors="coerce"
+                )
+            for column in [
+                "BreakEven_Activated", "Trailing_Stop_Activated"
+            ]:
+                self.open_positions[column] = self._boolean(
+                    self.open_positions[column]
+                )
+            self.open_positions = self.open_positions.loc[
+                self.open_positions["Status"]
+                .astype("string").str.upper().eq("OPEN")
+                & self.open_positions["Position_ID"].notna()
+                & self.open_positions["Symbol"].notna()
+            ].copy()
+            self.open_positions.drop_duplicates(
+                "Position_ID", keep="last", inplace=True
+            )
+            self.open_positions.reset_index(drop=True, inplace=True)
+
+            self.closed_trades = closed_frame.tail(
+                self.maximum_closed_trades
+            ).copy()
+            self.events = event_frame.tail(self.maximum_events).copy()
+            for frame in [self.open_positions, self.closed_trades]:
+                self.processed_decision_ids.update(
+                    frame["Decision_ID"].dropna().astype(str)
+                )
+
+            values = {}
+            if {"Metric", "Value"}.issubset(metadata.columns):
+                values = dict(zip(metadata["Metric"], metadata["Value"]))
+            realized = pd.to_numeric(
+                values.get("Realized PnL"), errors="coerce"
+            )
+            if pd.isna(realized):
+                realized = pd.to_numeric(
+                    self.closed_trades.get(
+                        "Net_PnL", pd.Series(dtype=float)
+                    ), errors="coerce"
+                ).fillna(0.0).sum()
+            self.realized_pnl = float(realized)
+            self.equity = self.initial_capital + self.realized_pnl
+            cycle = pd.to_numeric(values.get("Cycle"), errors="coerce")
+            if pd.notna(cycle):
+                self.cycle_number = int(cycle)
+            elif not self.events.empty:
+                cycles = pd.to_numeric(self.events["Cycle"], errors="coerce")
+                self.cycle_number = (
+                    int(cycles.max()) if cycles.notna().any() else 0
+                )
+            return True
+        except (ValueError, OSError, KeyError, TypeError):
+            self.open_positions = pd.DataFrame(columns=self.POSITION_COLUMNS)
+            self.closed_trades = pd.DataFrame(columns=self.TRADE_COLUMNS)
+            self.events = pd.DataFrame(columns=self.EVENT_COLUMNS)
+            self.processed_decision_ids.clear()
+            self.realized_pnl = 0.0
+            self.equity = self.initial_capital
+            self.cycle_number = 0
+            return False
 
     def _event(self, timestamp, symbol, position_id, event, price, quantity, reason):
         row = pd.DataFrame(
@@ -727,7 +921,15 @@ class FiveMinuteResidualStatisticalStrategy:
         ] = trailing_active
         self.open_positions.loc[index, "Stop_Adjustment_Reason"] = reason
 
-    def _close(self, index, exit_time, exit_price, reason, holding_candles=0):
+    def _close(
+        self,
+        index,
+        exit_time,
+        exit_price,
+        reason,
+        holding_candles=0,
+        apply_exit_slippage=True,
+    ):
         position = self.open_positions.loc[index].copy()
         direction = int(position["Direction"])
         quantity = int(position["Quantity"])
@@ -738,8 +940,12 @@ class FiveMinuteResidualStatisticalStrategy:
         if not np.isfinite(entry_market):
             entry_market = entry
         raw_exit = float(exit_price)
-        # Adverse paper slippage on exit.
-        filled_exit = raw_exit * (1.0 - direction * self.slippage_rate)
+        # A manually entered exit is treated as the actual executed fill.
+        # Strategy-generated exits retain adverse paper slippage.
+        filled_exit = (
+            raw_exit * (1.0 - direction * self.slippage_rate)
+            if apply_exit_slippage else raw_exit
+        )
         gross = (raw_exit - entry_market) * direction * quantity
         filled_gross = (filled_exit - entry) * direction * quantity
         slippage_cost = max(0.0, gross - filled_gross)
@@ -792,6 +998,59 @@ class FiveMinuteResidualStatisticalStrategy:
             "EXIT", filled_exit, quantity, reason,
         )
         self.open_positions.drop(index=index, inplace=True)
+
+    def _process_manual_exits(self):
+        """Close positions whose manual fill was entered in TradingLedge.xlsx."""
+        if not self.manual_ledger_file or self.open_positions.empty \
+                or not os.path.isfile(self.manual_ledger_file):
+            return
+        try:
+            manual = pd.read_excel(
+                self.manual_ledger_file,
+                sheet_name="Open_Trades",
+                usecols=["Trade_ID", "Manual_Exit_Price"],
+                engine="openpyxl",
+            )
+        except (ValueError, OSError, PermissionError):
+            return
+        if manual.empty:
+            return
+        manual["Trade_ID"] = manual["Trade_ID"].astype("string").str.strip()
+        manual["Manual_Exit_Price"] = pd.to_numeric(
+            manual["Manual_Exit_Price"], errors="coerce"
+        )
+        requested = manual.loc[
+            manual["Trade_ID"].notna()
+            & manual["Manual_Exit_Price"].gt(0)
+        ]
+        for request in requested.itertuples(index=False):
+            matches = self.open_positions.index[
+                self.open_positions["Position_ID"].astype(str).eq(
+                    str(request.Trade_ID)
+                )
+            ]
+            if len(matches) != 1:
+                continue
+            index = matches[0]
+            symbol = str(self.open_positions.loc[index, "Symbol"])
+            try:
+                latest = self._read_market_tail(symbol).iloc[-1]
+                exit_time = latest["DateTime"]
+            except Exception:
+                exit_time = pd.Timestamp.now()
+            candles_held = int(pd.to_numeric(
+                self.open_positions.loc[index, "Candles_Held"],
+                errors="coerce",
+            ))
+            self._close(
+                index=index,
+                exit_time=exit_time,
+                exit_price=float(request.Manual_Exit_Price),
+                reason="Sold Manually",
+                holding_candles=candles_held,
+                apply_exit_slippage=False,
+            )
+        del manual, requested
 
     def _monitor_open_positions(self, plans, plan_history, mathematical):
         approved_by_symbol = {
@@ -912,6 +1171,8 @@ class FiveMinuteResidualStatisticalStrategy:
                             errors="coerce",
                         ))
                         if (
+                            self.exit_on_residual_divergence
+                            and
                             position["Regime"] == "MEAN_REVERSION"
                             and np.isfinite(zscore)
                             and np.isfinite(entry_zscore)
@@ -928,10 +1189,16 @@ class FiveMinuteResidualStatisticalStrategy:
                             and abs(zscore)
                             <= self.mean_reversion_normalization_zscore
                             and candles_held > 0
+                            and (
+                                not self.require_profitable_residual_normalization
+                                or estimated_net
+                                >= self.minimum_normalization_net_pnl
+                            )
                         ):
                             self._close(
                                 index, latest["DateTime"], latest["Close"],
-                                "RESIDUAL_NORMALIZED", candles_held,
+                                "PROFITABLE_RESIDUAL_NORMALIZATION",
+                                candles_held,
                             )
                             exited = True
 
@@ -979,6 +1246,7 @@ class FiveMinuteResidualStatisticalStrategy:
             return
         for plan in plans.itertuples(index=False):
             decision_id = str(plan.Decision_ID)
+            pending_position_id = f"{decision_id}_{plan.Trade_Action}"
             if plan.Symbol in open_symbols or decision_id in self.processed_decision_ids:
                 continue
             if available <= 0:
@@ -986,11 +1254,83 @@ class FiveMinuteResidualStatisticalStrategy:
             try:
                 candles = self._read_market_tail(plan.Symbol)
                 latest = candles.iloc[-1]
+                snapshot = mathematical.get(plan.Symbol)
+                rejection = None
+                direction = 1 if plan.Trade_Action == "BUY" else -1
+                entry_age = (
+                    (latest["DateTime"] - plan.Decision_DateTime).total_seconds()
+                    / 60.0
+                    if pd.notna(latest["DateTime"])
+                    and pd.notna(plan.Decision_DateTime)
+                    else np.nan
+                )
+                if not np.isfinite(entry_age) or entry_age < 0:
+                    rejection = "INVALID_ENTRY_TIMESTAMP"
+                elif entry_age > self.maximum_entry_age_minutes:
+                    rejection = "STALE_SETUP_AT_ENTRY"
+                elif not np.isfinite(plan.Rank) or plan.Rank > self.maximum_entry_rank:
+                    rejection = "OUTSIDE_ENTRY_RANK_LIMIT"
+                elif snapshot is None:
+                    rejection = "MATHEMATICAL_SNAPSHOT_MISSING"
+                else:
+                    zscore = float(snapshot.Latest_Residual_ZScore)
+                    residual_return = float(snapshot.Latest_Residual_Return)
+                    quality = float(snapshot.Latest_Residual_Quality_Score)
+                    expected_regime = str(snapshot.Latest_Stable_Regime).upper()
+                    setup_valid = (
+                        bool(snapshot.Latest_Setup_Ready)
+                        and bool(snapshot.Latest_Setup_Accepted)
+                        and bool(snapshot.Latest_Residual_Stationary)
+                        and expected_regime == "MEAN_REVERSION"
+                    )
+                    residual_direction_valid = (
+                        (
+                            direction == 1
+                            and -self.maximum_entry_abs_zscore
+                            <= zscore <= -self.minimum_entry_abs_zscore
+                            and residual_return > 0
+                        )
+                        or (
+                            direction == -1
+                            and self.minimum_entry_abs_zscore
+                            <= zscore <= self.maximum_entry_abs_zscore
+                            and residual_return < 0
+                        )
+                    )
+                    price_turn_valid = (
+                        (direction == 1 and snapshot.Latest_Close > snapshot.Latest_Previous_Close)
+                        or (direction == -1 and snapshot.Latest_Close < snapshot.Latest_Previous_Close)
+                    )
+                    if not setup_valid:
+                        rejection = "SETUP_NO_LONGER_ACCEPTED"
+                    elif not np.isfinite(quality) or quality < self.minimum_residual_quality_score:
+                        rejection = "RESIDUAL_QUALITY_FAILED_AT_ENTRY"
+                    elif not residual_direction_valid:
+                        rejection = "RESIDUAL_ENTRY_CONFIRMATION_FAILED"
+                    elif not price_turn_valid:
+                        rejection = "PRICE_TURN_FAILED_AT_ENTRY"
+                    else:
+                        deviation = abs(float(latest["Close"]) - float(plan.Entry_Price))
+                        maximum_deviation = (
+                            self.maximum_entry_deviation_atr * float(plan.ATR_14)
+                        )
+                        if not np.isfinite(maximum_deviation) or deviation > maximum_deviation:
+                            rejection = "ENTRY_PRICE_MOVED_TOO_FAR"
+                if rejection:
+                    self.processed_decision_ids.add(decision_id)
+                    self._event(
+                        latest["DateTime"], plan.Symbol, pending_position_id,
+                        "ENTRY_SKIPPED",
+                        latest["Close"], plan.Quantity, rejection,
+                    )
+                    del candles
+                    continue
                 if self.force_exit_at_session_end \
                         and latest["DateTime"].time() >= self.session_exit_time:
                     self.processed_decision_ids.add(decision_id)
                     self._event(
-                        latest["DateTime"], plan.Symbol, "", "ENTRY_SKIPPED",
+                        latest["DateTime"], plan.Symbol, pending_position_id,
+                        "ENTRY_SKIPPED",
                         latest["Close"], plan.Quantity, "SESSION_ENDED",
                     )
                     del candles
@@ -1001,7 +1341,8 @@ class FiveMinuteResidualStatisticalStrategy:
                 if confirmation_count < self.entry_confirmation_cycles:
                     self.processed_decision_ids.add(decision_id)
                     self._event(
-                        latest["DateTime"], plan.Symbol, "", "ENTRY_WAITING",
+                        latest["DateTime"], plan.Symbol, pending_position_id,
+                        "ENTRY_WAITING",
                         latest["Close"], plan.Quantity,
                         f"CONFIRMATION_{confirmation_count}_OF_"
                         f"{self.entry_confirmation_cycles}",
@@ -1011,7 +1352,8 @@ class FiveMinuteResidualStatisticalStrategy:
                 if not self._cooldown_complete(plan.Symbol, latest["DateTime"]):
                     self.processed_decision_ids.add(decision_id)
                     self._event(
-                        latest["DateTime"], plan.Symbol, "", "ENTRY_WAITING",
+                        latest["DateTime"], plan.Symbol, pending_position_id,
+                        "ENTRY_WAITING",
                         latest["Close"], plan.Quantity, "REENTRY_COOLDOWN",
                     )
                     del candles
@@ -1020,12 +1362,12 @@ class FiveMinuteResidualStatisticalStrategy:
                 if halt_reason:
                     self.processed_decision_ids.add(decision_id)
                     self._event(
-                        latest["DateTime"], plan.Symbol, "", "ENTRY_SKIPPED",
+                        latest["DateTime"], plan.Symbol, pending_position_id,
+                        "ENTRY_SKIPPED",
                         latest["Close"], plan.Quantity, halt_reason,
                     )
                     del candles
                     continue
-                direction = 1 if plan.Trade_Action == "BUY" else -1
                 # Adverse paper slippage on entry.
                 entry = float(latest["Close"]) * (
                     1.0 + direction * self.slippage_rate
@@ -1038,7 +1380,7 @@ class FiveMinuteResidualStatisticalStrategy:
                     raise ValueError("invalid approved trade plan")
                 stop = entry - direction * distance
                 target = entry + direction * rr * distance
-                position_id = f"{decision_id}_{plan.Trade_Action}"
+                position_id = pending_position_id
                 position = {
                     "Position_ID": position_id,
                     "Decision_ID": decision_id,
@@ -1197,23 +1539,222 @@ class FiveMinuteResidualStatisticalStrategy:
         del summary
         return str(target)
 
+    def _save_position_journal(self, plans):
+        """Atomically persist restart-safe execution state outside reports."""
+        if not self.position_journal_file:
+            return None
+        target = Path(self.position_journal_file).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        metadata = pd.DataFrame({
+            "Metric": [
+                "Journal Version", "Updated UTC", "Execution Mode",
+                "Cycle", "Initial Capital", "Realized PnL",
+                "Current Equity", "Open Position Count",
+                "Closed Trade Count", "Recovery Rule",
+            ],
+            "Value": [
+                1, pd.Timestamp.now(tz="UTC").isoformat(), "PAPER_ONLY",
+                self.cycle_number, self.initial_capital, self.realized_pnl,
+                self.equity, len(self.open_positions),
+                len(self.closed_trades),
+                "Restore existing positions; never create duplicate entries",
+            ],
+        })
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".fmrss_position_journal_",
+            suffix=".xlsx",
+            dir=target.parent,
+        )
+        os.close(descriptor)
+        try:
+            with pd.ExcelWriter(temporary, engine="openpyxl") as writer:
+                metadata.to_excel(
+                    writer, sheet_name="Recovery_Metadata", index=False
+                )
+                self.open_positions.to_excel(
+                    writer, sheet_name="Open_Positions", index=False
+                )
+                plans.reindex(columns=self.PLAN_COLUMNS).to_excel(
+                    writer, sheet_name="Current_Risk_Plans", index=False
+                )
+                self.closed_trades.to_excel(
+                    writer, sheet_name="Closed_Trades", index=False
+                )
+                self.events.to_excel(
+                    writer, sheet_name="Event_Log", index=False
+                )
+                for worksheet in writer.book.worksheets:
+                    worksheet.freeze_panes = "A2"
+                    worksheet.auto_filter.ref = worksheet.dimensions
+                    worksheet.sheet_view.showGridLines = False
+            os.replace(temporary, target)
+        except Exception:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+            raise
+        del metadata
+        return str(target)
+
+    def _manual_open_view(self):
+        if self.open_positions.empty:
+            return pd.DataFrame(columns=self.MANUAL_LEDGER_COLUMNS)
+        source = self.open_positions.copy()
+        result = pd.DataFrame({
+            "Trade_ID": source["Position_ID"],
+            "Symbol": source["Symbol"],
+            "Entry_Action": source["Entry_Action"],
+            "Regime": source["Regime"],
+            "Rank": source["Rank"],
+            "Entry_Time": source["Entry_Time"],
+            "Entry_Price": source["Entry_Price"],
+            "Stop_Loss": source["Stop_Loss"],
+            "Target_Price": source["Target_Price"],
+            "Quantity": source["Quantity"],
+            "Status": "OPEN",
+            "Current_Price": source["Current_Price"],
+            "Exit_Time": pd.NaT,
+            "Exit_Price": np.nan,
+            "Exit_Reason": "",
+            "Gross_PnL": source["Unrealized_PnL"],
+            "Total_Trading_Cost": source["Estimated_Exit_Charges"],
+            "Net_PnL": source["Estimated_Net_PnL"],
+            "Portfolio_Value": self.equity,
+            # This is the only user-editable execution field.
+            "Manual_Exit_Price": np.nan,
+        })
+        return result.reindex(columns=self.MANUAL_LEDGER_COLUMNS)
+
+    def _manual_closed_view(self):
+        if self.closed_trades.empty:
+            return pd.DataFrame(columns=self.MANUAL_LEDGER_COLUMNS)
+        source = self.closed_trades.copy()
+        result = pd.DataFrame({
+            "Trade_ID": source["Position_ID"],
+            "Symbol": source["Symbol"],
+            "Entry_Action": source["Entry_Action"],
+            "Regime": source["Regime"],
+            "Rank": source["Rank"],
+            "Entry_Time": source["Entry_Time"],
+            "Entry_Price": source["Entry_Price"],
+            "Stop_Loss": source["Stop_Loss"],
+            "Target_Price": source["Target_Price"],
+            "Quantity": source["Quantity"],
+            "Status": "CLOSED",
+            "Current_Price": source["Exit_Price"],
+            "Exit_Time": source["Exit_Time"],
+            "Exit_Price": source["Exit_Price"],
+            "Exit_Reason": source["Exit_Reason"],
+            "Gross_PnL": source["Gross_PnL"],
+            "Total_Trading_Cost": source["Total_Trading_Cost"],
+            "Net_PnL": source["Net_PnL"],
+            "Portfolio_Value": source["Equity_After"],
+            "Manual_Exit_Price": np.nan,
+        })
+        return result.reindex(columns=self.MANUAL_LEDGER_COLUMNS)
+
+    def _save_manual_ledger(self):
+        if not self.manual_ledger_file:
+            return None
+        target = Path(self.manual_ledger_file).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        open_view = self._manual_open_view()
+        closed_view = self._manual_closed_view()
+        ledger_parts = [
+            frame for frame in [closed_view, open_view] if not frame.empty
+        ]
+        trading_history = (
+            pd.concat(ledger_parts, ignore_index=True)
+            if ledger_parts
+            else pd.DataFrame(columns=self.MANUAL_LEDGER_COLUMNS)
+        ).reindex(columns=self.MANUAL_LEDGER_COLUMNS)
+        summary = self._summary()
+        instructions = pd.DataFrame({
+            "Instruction": [
+                "To close a trade manually, enter the actual executed price in Manual_Exit_Price on Open_Trades.",
+                "Save and close the workbook. The next Phase B poll will move the trade to Closed_Trades.",
+                "Do not change Trade_ID. A manual fill is recorded with Exit_Reason Sold Manually.",
+            ]
+        })
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".trading_ledge_", suffix=".xlsx", dir=target.parent
+        )
+        os.close(descriptor)
+        try:
+            with pd.ExcelWriter(temporary, engine="openpyxl") as writer:
+                summary.to_excel(writer, sheet_name="Summary", index=False)
+                open_view.to_excel(writer, sheet_name="Open_Trades", index=False)
+                closed_view.to_excel(
+                    writer, sheet_name="Closed_Trades", index=False
+                )
+                trading_history.to_excel(
+                    writer, sheet_name="Trading_Ledger", index=False
+                )
+                instructions.to_excel(
+                    writer, sheet_name="Instructions", index=False
+                )
+                for worksheet in writer.book.worksheets:
+                    worksheet.freeze_panes = "A2"
+                    worksheet.auto_filter.ref = worksheet.dimensions
+                    worksheet.sheet_view.showGridLines = False
+                open_sheet = writer.book["Open_Trades"]
+                manual_column = self.MANUAL_LEDGER_COLUMNS.index(
+                    "Manual_Exit_Price"
+                ) + 1
+                from openpyxl.styles import PatternFill
+                fill = PatternFill(
+                    fill_type="solid", fgColor="FFF2CC"
+                )
+                for cell in open_sheet.iter_cols(
+                    min_col=manual_column,
+                    max_col=manual_column,
+                    min_row=2,
+                ):
+                    for item in cell:
+                        item.fill = fill
+            os.replace(temporary, target)
+        except Exception:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+            raise
+        del open_view, closed_view, ledger_parts
+        del trading_history, summary, instructions
+        return str(target)
+
     def run_cycle(self):
         self.cycle_number += 1
         plans = self._load_approved_plans()
         plan_history = self._load_plan_history()
         mathematical = self._load_mathematical_snapshot()
+        # Read manual instructions before any workbook is refreshed.
+        self._process_manual_exits()
         self._monitor_open_positions(plans, plan_history, mathematical)
         self.open_positions.reset_index(drop=True, inplace=True)
         self._open_new_positions(plans, plan_history, mathematical)
 
         saved = None
+        journal_saved = None
         if self.save_excel:
             saved = self._save_state(plans)
             if not os.path.isfile(saved) or os.path.getsize(saved) == 0:
                 raise RuntimeError("Strategy state workbook verification failed")
+            manual_saved = self._save_manual_ledger()
+            if manual_saved and (
+                not os.path.isfile(manual_saved)
+                or os.path.getsize(manual_saved) == 0
+            ):
+                raise RuntimeError("Manual trading ledger verification failed")
+        if self.position_journal_file:
+            journal_saved = self._save_position_journal(plans)
+            if (
+                not journal_saved
+                or not os.path.isfile(journal_saved)
+                or os.path.getsize(journal_saved) == 0
+            ):
+                raise RuntimeError("Position recovery journal verification failed")
 
         report = self._summary()
         report.attrs["Excel_File"] = saved
+        report.attrs["Position_Journal_File"] = journal_saved
         report.attrs["Open_Positions"] = len(self.open_positions)
         report.attrs["Closed_Trades"] = len(self.closed_trades)
         if self.print_details:

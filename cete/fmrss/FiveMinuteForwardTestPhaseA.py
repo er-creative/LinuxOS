@@ -48,6 +48,7 @@ class FiveMinuteForwardTestPhaseA:
         quiet=True,
         garbage_collect_each_cycle=True,
         compact_test_files_every_ticks=100,
+        data_mode="synthetic",
     ):
         if history_candles < 500:
             raise ValueError("history_candles must be at least 500")
@@ -58,9 +59,16 @@ class FiveMinuteForwardTestPhaseA:
 
         self.symbols_file = str(symbols_file)
         self.source_data_folder = Path(source_data_folder).expanduser().resolve()
+        self.data_mode = str(data_mode).strip().lower()
+        if self.data_mode not in {"synthetic", "live"}:
+            raise ValueError("data_mode must be 'synthetic' or 'live'")
         self.nifty_filename = str(nifty_filename)
         self.tests_folder = Path(tests_folder).expanduser().resolve()
-        self.test_data_folder = self.tests_folder / "synthetic_market_data"
+        self.test_data_folder = (
+            self.tests_folder / "synthetic_market_data"
+            if self.data_mode == "synthetic"
+            else self.source_data_folder
+        )
         self.history_candles = int(history_candles)
         self.expected_share_count = int(expected_share_count)
         self.interval_seconds = float(interval_seconds)
@@ -112,8 +120,32 @@ class FiveMinuteForwardTestPhaseA:
         self._stop_event = threading.Event()
         self._cycle_lock = threading.Lock()
         self._market_lock = threading.RLock()
+        self._last_processed_market_timestamp = None
 
-        self._prepare_test_market()
+        if self.data_mode == "synthetic":
+            self._prepare_test_market()
+        else:
+            self._prepare_live_market()
+
+    @staticmethod
+    def _atomic_json(payload, path):
+        """Publish a state manifest only after a full snapshot succeeds."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{path.stem}_", suffix=".json", dir=path.parent
+        )
+        os.close(descriptor)
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except Exception:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+            raise
 
     @staticmethod
     def _normalized_benchmark(symbol):
@@ -136,6 +168,32 @@ class FiveMinuteForwardTestPhaseA:
         if nifty:
             return self.source_data_folder / self.nifty_filename
         return self.source_data_folder / f"{symbol}_5mins.txt"
+
+    def _prepare_live_market(self):
+        """Initialize read-only mode from the newest uploaded NIFTY candle."""
+        latest = self._read_market_file(
+            self._source_path(nifty=True), "NIFTY 50", limit=1,
+            require_volume=False,
+        )
+        timestamp = pd.Timestamp(latest["DateTime"].iloc[-1])
+        self.market_state["__NIFTY__"] = {"timestamp": timestamp}
+        del latest
+        if self.paths["state"].is_file() and not self.reset_test_data:
+            try:
+                saved = json.loads(self.paths["state"].read_text())
+                self.cycle_number = int(saved.get("cycle_number", 0))
+            except (ValueError, OSError, TypeError):
+                pass
+
+    def _refresh_live_timestamp(self):
+        latest = self._read_market_file(
+            self._source_path(nifty=True), "NIFTY 50", limit=1,
+            require_volume=False,
+        )
+        timestamp = pd.Timestamp(latest["DateTime"].iloc[-1])
+        self.market_state["__NIFTY__"]["timestamp"] = timestamp
+        del latest
+        return timestamp
 
     def _test_path(self, symbol=None, nifty=False):
         if nifty:
@@ -418,6 +476,11 @@ class FiveMinuteForwardTestPhaseA:
                 autocorrelation_window=60, autocorrelation_min_periods=50,
                 momentum_threshold=0.10, mean_reversion_threshold=-0.10,
                 stability_candles=3, strength_reference=0.30,
+                minimum_half_life_candles=2.0,
+                maximum_half_life_candles=12.0,
+                minimum_zero_crossings=2,
+                minimum_variance_ratio=0.35,
+                maximum_variance_ratio=2.50,
                 numerical_epsilon=1e-12, use_cython=self.use_cython,
                 memory_optimized=True, retain_results_in_memory=True,
                 save_excel=False,
@@ -446,15 +509,20 @@ class FiveMinuteForwardTestPhaseA:
                 residual_zscore_reference=3.0, volume_factor_reference=2.0,
                 momentum_consistency_window=5,
                 reversion_consistency_window=3,
-                minimum_mathematical_score=65.0,
+                minimum_mathematical_score=60.0,
+                minimum_residual_quality_score=50.0,
+                minimum_expected_move_percent=0.30,
+                estimated_round_trip_cost_percent=0.11,
+                minimum_edge_to_cost_ratio=2.0,
                 memory_optimized=True,
                 report_output_file=str(self.paths["score"]),
                 save_excel=True, print_symbol_details=False,
             ),
             "ranker": FiveMinuteCrossSectionalRanker(
                 maximum_selected_symbols=5,
-                mathematical_weight=0.60, residual_weight=0.25,
-                volume_weight=0.15, maximum_staleness_minutes=5,
+                mathematical_weight=0.45, residual_weight=0.15,
+                volume_weight=0.10, quality_weight=0.20,
+                economic_edge_weight=0.10, maximum_staleness_minutes=5,
                 mathematical_score_file=str(self.paths["score"]),
                 accepted_sheet_name="Accepted_Setups",
                 ranking_output_file=str(self.paths["ranking"]),
@@ -481,15 +549,31 @@ class FiveMinuteForwardTestPhaseA:
         started = time.perf_counter()
         removed = []
         try:
-            self.cycle_number += 1
             if generate_candle:
+                if self.data_mode != "synthetic":
+                    raise RuntimeError("live mode cannot generate synthetic candles")
                 timestamp, generated = self._generate_candles()
             else:
                 with self._market_lock:
-                    timestamp = self.market_state["__NIFTY__"]["timestamp"]
+                    timestamp = (
+                        self._refresh_live_timestamp()
+                        if self.data_mode == "live"
+                        else self.market_state["__NIFTY__"]["timestamp"]
+                    )
                 generated = [("NIFTY 50", np.nan)] + [
                     (symbol, np.nan) for symbol in self.symbols
                 ]
+            timestamp = pd.Timestamp(timestamp)
+            if (
+                self._last_processed_market_timestamp is not None
+                and timestamp <= self._last_processed_market_timestamp
+            ):
+                return {
+                    "Cycle": self.cycle_number,
+                    "Synthetic_DateTime": timestamp,
+                    "Status": "SKIPPED_NO_NEW_MARKET_CANDLE",
+                }
+            self.cycle_number += 1
             shares_data, nifty_data = self._load_cycle_market()
             engines = self._build_engines()
             backends = self._verify_backends(engines)
@@ -570,11 +654,29 @@ class FiveMinuteForwardTestPhaseA:
             self.last_result = result
             self.last_error = None
             self._atomic_report(pd.DataFrame([result]), self.paths["status"], "Phase_A")
-            self.paths["state"].write_text(json.dumps({
+            snapshot_id = f"{self.cycle_number}:{timestamp.isoformat()}"
+            ranking_stat = self.paths["ranking"].stat()
+            score_stat = self.paths["score"].stat()
+            self._atomic_json({
                 "cycle_number": self.cycle_number,
                 "generated_tick_count": self.generated_tick_count,
                 "synthetic_datetime": str(timestamp),
-            }))
+                "snapshot_id": snapshot_id,
+                "ranking_file": str(self.paths["ranking"]),
+                "mathematical_score_file": str(self.paths["score"]),
+                # These tokens bind the manifest to the exact workbooks that
+                # completed this cycle. Phase B uses them instead of comparing
+                # worksheet timestamps, which may be blank when Selected=0.
+                "ranking_mtime_ns": ranking_stat.st_mtime_ns,
+                "ranking_size": ranking_stat.st_size,
+                "score_mtime_ns": score_stat.st_mtime_ns,
+                "score_size": score_stat.st_size,
+                "status": "COMPLETED",
+                "data_mode": self.data_mode,
+                "market_data_folder": str(self.test_data_folder),
+                "published_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+            }, self.paths["state"])
+            self._last_processed_market_timestamp = timestamp
             del ranking_report, generated, engines
             if self.garbage_collect_each_cycle:
                 gc.collect()
@@ -621,20 +723,20 @@ class FiveMinuteForwardTestPhaseA:
         if self.is_running:
             raise RuntimeError("Phase A is already running")
         self._stop_event.clear()
-        self._generator_thread = threading.Thread(
-            target=self._generator_loop,
-            name="FMRSS-Synthetic-Market-Generator",
-            daemon=True,
-        )
-        # Start the one-second feed before the first potentially long pipeline
-        # pass, so candle generation is never blocked by engine runtime.
-        self._generator_thread.start()
+        if self.data_mode == "synthetic":
+            self._generator_thread = threading.Thread(
+                target=self._generator_loop,
+                name="FMRSS-Synthetic-Market-Generator",
+                daemon=True,
+            )
+            self._generator_thread.start()
         try:
             if run_immediately:
-                self.run_one_cycle()
+                self.run_one_cycle(generate_candle=self.data_mode == "synthetic")
         except Exception:
             self._stop_event.set()
-            self._generator_thread.join(timeout=10.0)
+            if self._generator_thread is not None:
+                self._generator_thread.join(timeout=10.0)
             raise
         self._pipeline_thread = threading.Thread(
             target=self._pipeline_loop,
@@ -703,6 +805,10 @@ def main():
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--compact-every-ticks", type=int, default=100)
     parser.add_argument(
+        "--data-mode", choices=["synthetic", "live"], default="synthetic",
+        help="synthetic appends random candles; live reads uploaded files only.",
+    )
+    parser.add_argument(
         "--reset-test-data",
         action="store_true",
         help="Discard earlier synthetic files and reseed them from real data.",
@@ -743,12 +849,15 @@ def main():
         quiet=not arguments.show_engine_output,
         garbage_collect_each_cycle=True,
         compact_test_files_every_ticks=arguments.compact_every_ticks,
+        data_mode=arguments.data_mode,
     )
 
     print("=" * 100)
     print("FMRSS FORWARD TEST : PHASE A")
     print(f"Shares                 : {len(phase_a.symbols)}")
     print(f"Synthetic interval     : {phase_a.interval_seconds:.2f} second(s)")
+    print(f"Data mode              : {phase_a.data_mode.upper()}")
+    print(f"Market data folder     : {phase_a.test_data_folder}")
     print(f"Tests folder           : {phase_a.tests_folder}")
     print("Stop command           : Ctrl+C")
     print("=" * 100)

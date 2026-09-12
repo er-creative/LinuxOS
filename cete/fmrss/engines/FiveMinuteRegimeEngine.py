@@ -29,6 +29,7 @@ class FiveMinuteRegimeEngine:
         "Symbol",
         "DateTime",
         "Residual_Return",
+        "Residual_Level",
         "Residual_Features_Ready"
     ]
 
@@ -52,6 +53,11 @@ class FiveMinuteRegimeEngine:
         stability_candles=3,
         strength_reference=0.30,
         numerical_epsilon=1e-12,
+        minimum_half_life_candles=2.0,
+        maximum_half_life_candles=12.0,
+        minimum_zero_crossings=2,
+        minimum_variance_ratio=0.35,
+        maximum_variance_ratio=2.50,
         use_cython=True,
         memory_optimized=True,
         retain_results_in_memory=False,
@@ -125,6 +131,17 @@ class FiveMinuteRegimeEngine:
         self.numerical_epsilon = float(
             numerical_epsilon
         )
+        if not 0 < minimum_half_life_candles < maximum_half_life_candles:
+            raise ValueError("half-life limits are invalid")
+        if minimum_zero_crossings < 1:
+            raise ValueError("minimum_zero_crossings must be positive")
+        if not 0 < minimum_variance_ratio < maximum_variance_ratio:
+            raise ValueError("variance-ratio limits are invalid")
+        self.minimum_half_life_candles = float(minimum_half_life_candles)
+        self.maximum_half_life_candles = float(maximum_half_life_candles)
+        self.minimum_zero_crossings = int(minimum_zero_crossings)
+        self.minimum_variance_ratio = float(minimum_variance_ratio)
+        self.maximum_variance_ratio = float(maximum_variance_ratio)
 
         self.use_cython = bool(use_cython)
         self.memory_optimized = bool(memory_optimized)
@@ -196,6 +213,9 @@ class FiveMinuteRegimeEngine:
             result["Residual_Return"],
             errors="coerce"
         )
+        result["Residual_Level"] = pd.to_numeric(
+            result["Residual_Level"], errors="coerce"
+        ).replace([np.inf, -np.inf], np.nan)
 
         result["Residual_Return"] = (
             result["Residual_Return"]
@@ -244,6 +264,62 @@ class FiveMinuteRegimeEngine:
             )
 
         return result
+
+    def _calculate_ou_diagnostics(self, df):
+        """Estimate dX = a + b*X[-1]; b<0 implies mean reversion."""
+        level = df["Residual_Level"].astype(np.float64)
+        lagged = level.shift(1)
+        change = level.diff()
+        window = self.autocorrelation_window
+        minimum = self.autocorrelation_min_periods
+        covariance = lagged.rolling(window, min_periods=minimum).cov(change)
+        variance = lagged.rolling(window, min_periods=minimum).var(ddof=1)
+        slope = covariance / variance.where(variance.gt(self.numerical_epsilon))
+        phi = 1.0 + slope
+        half_life = pd.Series(np.nan, index=df.index, dtype=np.float64)
+        valid_phi = phi.gt(0.0) & phi.lt(1.0)
+        half_life.loc[valid_phi] = -np.log(2.0) / np.log(phi.loc[valid_phi])
+
+        centered = level - level.rolling(window, min_periods=minimum).mean()
+        crossings = (
+            centered.mul(centered.shift(1)).le(0)
+            & centered.notna() & centered.shift(1).notna()
+        ).rolling(window, min_periods=minimum).sum()
+        short_window = max(10, window // 3)
+        variance_ratio = (
+            level.rolling(short_window, min_periods=short_window).std(ddof=1)
+            / level.rolling(window, min_periods=minimum).std(ddof=1)
+        )
+        stationary = (
+            half_life.between(
+                self.minimum_half_life_candles,
+                self.maximum_half_life_candles,
+            )
+            & crossings.ge(self.minimum_zero_crossings)
+            & variance_ratio.between(
+                self.minimum_variance_ratio,
+                self.maximum_variance_ratio,
+            )
+        )
+        quality = (
+            40.0 * (1.0 - (
+                (half_life - 0.5 * (
+                    self.minimum_half_life_candles
+                    + self.maximum_half_life_candles
+                )).abs()
+                / (self.maximum_half_life_candles - self.minimum_half_life_candles)
+            ).clip(0.0, 1.0))
+            + 30.0 * (crossings / max(self.minimum_zero_crossings * 2, 1)).clip(0, 1)
+            + 30.0 * (1.0 - (variance_ratio - 1.0).abs()).clip(0, 1)
+        ).where(stationary)
+        dtype = np.float32 if self.memory_optimized else np.float64
+        df["OU_Slope"] = slope.astype(dtype, copy=False)
+        df["Residual_Half_Life"] = half_life.astype(dtype, copy=False)
+        df["Residual_Zero_Crossings"] = crossings.fillna(0).astype(np.int16)
+        df["Residual_Variance_Ratio"] = variance_ratio.astype(dtype, copy=False)
+        df["Residual_Stationary"] = stationary.fillna(False).astype(bool)
+        df["Residual_Quality_Score"] = quality.astype(dtype, copy=False)
+        return df
 
     # =====================================================
     # Calculate Lag-One Residual Autocorrelation
@@ -407,13 +483,13 @@ class FiveMinuteRegimeEngine:
         df["Raw_Regime"] = np.select(
             condlist=[
                 ~regime_ready,
+                df["Residual_Stationary"],
                 rho >= self.momentum_threshold,
-                rho <= self.mean_reversion_threshold
             ],
             choicelist=[
                 "NOT_READY",
+                "MEAN_REVERSION",
                 "MOMENTUM",
-                "MEAN_REVERSION"
             ],
             default="RANDOM"
         )
@@ -496,6 +572,10 @@ class FiveMinuteRegimeEngine:
             lower=0.0,
             upper=100.0
         )
+        strength = strength.where(
+            ~df["Raw_Regime"].astype("string").eq("MEAN_REVERSION"),
+            df["Residual_Quality_Score"],
+        )
 
         df["Regime_Strength"] = strength.where(
             df["Regime_Features_Ready"],
@@ -546,6 +626,8 @@ class FiveMinuteRegimeEngine:
             self._calculate_autocorrelation_diagnostics(df)
         )
 
+        df = self._calculate_ou_diagnostics(df)
+
         df = self._classify_raw_regime(df)
 
         df = self._calculate_regime_stability(df)
@@ -574,6 +656,11 @@ class FiveMinuteRegimeEngine:
             "Latest_TStatistic": (
                 latest["Autocorrelation_TStatistic"]
             ),
+            "Latest_Residual_Half_Life": latest["Residual_Half_Life"],
+            "Latest_Residual_Zero_Crossings": latest["Residual_Zero_Crossings"],
+            "Latest_Residual_Variance_Ratio": latest["Residual_Variance_Ratio"],
+            "Latest_Residual_Stationary": bool(latest["Residual_Stationary"]),
+            "Latest_Residual_Quality_Score": latest["Residual_Quality_Score"],
             "Latest_Raw_Regime": latest["Raw_Regime"],
             "Latest_Stable_Regime": latest["Stable_Regime"],
             "Latest_Regime_Stable": bool(

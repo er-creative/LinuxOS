@@ -34,6 +34,9 @@ class FiveMinuteResidualEngine:
         "Rolling_Beta",
         "Residual_Return",
         "Residual_Impulse",
+        "Residual_Level",
+        "Residual_Fair_Value",
+        "Expected_Reversion_Return",
         "Residual_ZScore",
         "Residual_Features_Ready",
     ]
@@ -507,6 +510,27 @@ class FiveMinuteResidualEngine:
 
         return df
 
+    def _calculate_residual_equilibrium(self, df):
+        """Create a finite-horizon residual level and implied fair value.
+
+        A rolling sum is used instead of an all-history cumulative sum so an
+        old structural break cannot dominate today's signal.  The calculation
+        contains only completed candles and therefore has no look-ahead.
+        """
+        residual_level = (
+            df["Residual_Return"]
+            .rolling(
+                window=self.zscore_window,
+                min_periods=self.zscore_min_periods,
+            )
+            .sum()
+        )
+        expected = (-residual_level).clip(lower=-0.10, upper=0.10)
+        df["Residual_Level"] = residual_level
+        df["Expected_Reversion_Return"] = expected
+        df["Residual_Fair_Value"] = df["Close"] * np.exp(expected)
+        return df
+
     # =====================================================
     # Median Absolute Deviation
     # =====================================================
@@ -731,6 +755,8 @@ class FiveMinuteResidualEngine:
 
         df = self._calculate_residual_impulse(df)
 
+        df = self._calculate_residual_equilibrium(df)
+
         df = self._calculate_robust_zscore(df)
 
         df = self._calculate_feature_state(df)
@@ -770,6 +796,11 @@ class FiveMinuteResidualEngine:
             ),
             "Latest_Residual_Impulse": (
                 df["Residual_Impulse"].iloc[-1]
+            ),
+            "Latest_Residual_Level": df["Residual_Level"].iloc[-1],
+            "Latest_Residual_Fair_Value": df["Residual_Fair_Value"].iloc[-1],
+            "Latest_Expected_Reversion_Return": (
+                df["Expected_Reversion_Return"].iloc[-1]
             ),
             "Latest_Residual_ZScore": (
                 df["Residual_ZScore"].iloc[-1]
