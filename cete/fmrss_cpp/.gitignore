@@ -1,0 +1,21 @@
+# CMake and compiled files
+build/
+cmake-build-*/
+.cache/
+*.o
+*.a
+*.so
+*.out
+
+# IDE files
+.vscode/
+.idea/
+
+# Runtime-generated files
+logs/
+output/
+*.log
+
+# Temporary files
+*.tmp
+*~
