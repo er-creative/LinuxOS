@@ -1,0 +1,2 @@
+# Reserved for later NSE tick-size work. One symbol per line.
+# No overrides enabled yet.

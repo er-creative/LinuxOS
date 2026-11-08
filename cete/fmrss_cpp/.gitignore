@@ -1,8 +1,18 @@
-# CMake and compiled files
+# CMake and compilation output
 build/
 cmake-build-*/
 .cache/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Compiled files
 *.o
+*.obj
 *.a
 *.so
 *.out
@@ -11,7 +21,7 @@ cmake-build-*/
 .vscode/
 .idea/
 
-# Runtime-generated files
+# Runtime-generated output
 logs/
 output/
 *.log

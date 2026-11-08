@@ -136,6 +136,14 @@ private:
             log_returns;
 
 
+        // Cached two-pass population standard deviations. Recomputed only
+        // when a new completed candle contributes to this timeframe.
+        double cached_return_stddev_20{volatilityFeatureNaN()};
+        double cached_return_stddev_50{volatilityFeatureNaN()};
+        double cached_realized_volatility_20{volatilityFeatureNaN()};
+        double cached_realized_volatility_50{volatilityFeatureNaN()};
+
+
         void reset() noexcept;
     };
 

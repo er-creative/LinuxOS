@@ -1,0 +1,328 @@
+#include "devai/strategy/dev_ai_strategy/reward/DevCandleManagerReplay_D9F4C.hpp"
+#include "devai/strategy/dev_ai_strategy/DevHistoricalTrainingCache.hpp"
+#include "devai/strategy/dev_ai_strategy/risk/DevSessionSupervisor.hpp"
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <set>
+#include <stdexcept>
+
+namespace devai::strategy::d9f4c {
+namespace {
+void check(bool ok, const char* message) {
+    if (!ok) throw std::runtime_error(message);
+}
+constexpr int cutoff = 15 * 60 + 15;
+constexpr int entry_cutoff = 14 * 60 + 45;
+
+// The candidates and their ranking are ALREADY present in the causal
+// historical decision cache. This replay does not recompute a ranking from
+// future candles. DevManager owns selection and all trade authorization.
+DevManagerEncodedState encode(const DevHistoricalDecisionRecord& r,
+                              const DevOOSLedgerState& ledger,
+                              double equity, double capital,
+                              const DevSharedNeuralNetwork& net) {
+    DevManagerEncodedState s{};
+    s.decision_time = r.decision_time;
+    s.valid_actions[0] = true; // EXIT if invested, WAIT if flat
+    s.valid_actions[1] = ledger.quantity > 0;
+    s.valid_actions[6] = false; // Enabled only if slot 4 has an eligible rank-5 LONG candidate.
+    std::set<std::size_t> slots;
+    for (const auto& c : r.candidates) {
+        check(c.slot_index < DEV_AGENT_SLOT_COUNT && slots.insert(c.slot_index).second,
+              "D9F4C candle: invalid or duplicate agent slot");
+        const auto q = net.predictAgent(c.observation);
+        const auto base = c.slot_index * 8;
+        for (std::size_t a = 0; a < 4; ++a)
+            s.values[base+a] = std::clamp(q.values[a], -10.0, 10.0);
+        s.values[base+4] = std::clamp(c.candidate_score/100.0, -1.0, 1.0);
+        s.values[base+5] = 1.0;
+        s.values[base+6] = static_cast<double>(c.slot_index)/4.0;
+        s.values[base+7] = 1.0;
+        s.valid_actions[2+c.slot_index] =
+            (c.candidate_rank == c.slot_index + 1) && // Stage 5D: all five slots are LONG-eligible.
+            (DevCandleManagerReplay::minuteIST(r.decision_time) < entry_cutoff ||
+             (ledger.quantity > 0 && c.symbol == ledger.held_symbol));
+    }
+    s.values[40] = ledger.quantity > 0 ? 1.0 : 0.0;
+    s.values[41] = (equity-capital)/capital;
+    s.values[42] = ledger.peak_equity > 0.0
+        ? (std::max(ledger.peak_equity,equity)-equity)/std::max(ledger.peak_equity,equity) : 0.0;
+    s.values[43] = static_cast<double>(r.candidates.size())/5.0;
+    s.numerical_integrity = true;
+    return s;
+}
+// F3E-D1 experimental restriction. This changes the legal action mask BEFORE
+// greedy model selection. Existing F3C behavior is identical when minutes == 0.
+void restrictYoungPosition(DevManagerEncodedState& state,
+                           const DevHistoricalDecisionRecord& record,
+                           const DevOOSLedgerState& position,
+                           int minutes,
+                           bool exit_required) {
+    if (minutes == 0 || position.quantity == 0 || exit_required) return;
+    check(minutes >= 0, "F3E-D1: negative holding period");
+    check(record.decision_time >= position.entry_time,
+          "F3E-D1: entry time is after decision");
+    const auto elapsed = record.decision_time - position.entry_time;
+    if (elapsed >= static_cast<std::int64_t>(minutes) * 60) return;
+    // Ordinary EXIT and SWITCH prohibited; KEEP is always legal.
+    // Emergency and mandatory exits bypass this restriction in choose().
+    state.valid_actions[0] = false;
+    state.valid_actions[1] = true;
+    for (const auto& c : record.candidates)
+        if (c.symbol != position.held_symbol)
+            state.valid_actions[2 + c.slot_index] = false;
+}
+std::size_t choose(const DevManagerEncodedState& s,
+                   const session::Assessment& supervisor,
+                   const DevManagerQValues& q) {
+    // Frozen model inference; no exploration and no train() calls.
+    if (DevCandleManagerReplay::minuteIST(s.decision_time) >= cutoff) return 0;
+    auto a = static_cast<std::size_t>(q.greedyAction(s.valid_actions));
+    // A mandatory stop-loss or session exit overrides the frozen model.
+    if (supervisor.recommendation == session::Recommendation::EXIT_REQUIRED) return 0;
+    // Advisory recommendations do not override the frozen manager policy.
+    // A calibrated HOLD-vs-EXIT estimator is required before advisory arbitration.
+    check(a < DEV_MANAGER_ACTION_COUNT && s.valid_actions[a], "D9F4C candle: illegal manager action");
+    return a;
+}
+std::string target(const DevHistoricalDecisionRecord& r,
+                   const DevOOSLedgerState& ledger, std::size_t action) {
+    if (action == 0) return {};
+    if (action == 1) {
+        check(ledger.quantity > 0, "D9F4C candle: KEEP without long");
+        return ledger.held_symbol;
+    }
+    const std::size_t slot = action-2;
+    for (const auto& c : r.candidates)
+        if (c.slot_index == slot) return c.symbol;
+    throw std::runtime_error("D9F4C candle: selected slot absent from candidates");
+}
+}
+int DevCandleManagerReplay::minuteIST(std::int64_t t) noexcept {
+    const auto local = ((t+19800)%86400+86400)%86400;
+    return static_cast<int>(local/60);
+}
+double DevCandleManagerReplay::markedEquity(const DevOOSLedgerState& s, double price) {
+    check(s.quantity >= 0, "D9F4C candle: short position prohibited");
+    check(s.quantity == 0 || (std::isfinite(price) && price > 0),
+          "D9F4C candle: invalid completed close");
+    const double equity = s.cash + static_cast<double>(s.quantity)*price;
+    check(std::isfinite(equity) && equity > 0, "D9F4C candle: invalid marked equity");
+    return equity;
+}
+CandleReplayReport DevCandleManagerReplay::run(const CandleReplayConfig& cfg) {
+    check(std::isfinite(cfg.capital) && cfg.capital > 0 &&
+          std::isfinite(cfg.allocation) && cfg.allocation > 0 && cfg.allocation <= .75,
+          "D9F4C candle: capital/allocation invalid");
+    check(cfg.minimum_holding_minutes >= 0 && cfg.minimum_holding_minutes <= 360,
+          "F3E-D1: holding period must be 0..360 minutes");
+    check(!cfg.shared_checkpoint.empty(), "D9F4C candle: checkpoint required");
+    const auto data = DevHistoricalTrainingCache::load(cfg.cache_file);
+    DevHistoricalTrainingDatasetValidator::validate(data);
+    check(!data.records.empty(), "D9F4C candle: no records");
+    std::set<std::string> symbols;
+    for (const auto& r : data.records)
+        for (const auto& c : r.candidates) symbols.insert(c.symbol);
+    check(!symbols.empty(), "D9F4C candle: no candidates");
+    DevHistoricalCloseStore prices;
+    for (const auto& symbol : symbols)
+        prices.loadMinuteFile(cfg.minute_folder/(symbol+"_1min.txt"), symbol);
+    DevSharedNeuralNetwork net;
+    net.load(cfg.shared_checkpoint); // load only, never save or train
+    DevOOSLedgerConfig lc{};
+    lc.initial_capital = cfg.capital;
+    lc.max_allocation_fraction = cfg.allocation;
+    lc.brokerage_rate = cfg.brokerage_rate;
+    lc.slippage_rate = cfg.slippage_rate;
+    lc.other_cost_rate = cfg.other_cost_rate;
+    lc.allow_intraday_short = false;
+    DevRealHistoricalMultiStockOOS ledger(lc);
+    auto price = [&](const std::string& symbol, std::int64_t t) {
+        return prices.completedClose(symbol,t);
+    };
+    CandleReplayReport report;
+    std::int64_t previous_time = 0;
+    double position_high = 0.0, position_low = 0.0;
+    for (std::size_t i=0; i<data.records.size(); ++i) {
+        const auto& r = data.records[i];
+        const bool terminal = minuteIST(r.decision_time) >= cutoff;
+        const auto next_time = r.decision_time+60;
+        check(r.decision_time > previous_time,
+              "D9F4C candle: nonchronological records");
+        // Terminal state is absorbing: no future candle is needed after 15:15.
+        // Before terminal, demand the immediately following causal record.
+        if (!terminal) {
+            check(i+1<data.records.size() &&
+                  data.records[i+1].decision_time == next_time,
+                  "D9F4C candle: missing consecutive minute");
+        }
+        previous_time = r.decision_time;
+        check(minuteIST(r.decision_time) >= 9*60+16 &&
+              minuteIST(r.decision_time) <= cutoff,
+              "D9F4C candle: decision outside supported session");
+        const auto before = ledger.state();
+        const double before_price = before.quantity ? price(before.held_symbol,r.decision_time) : 0.0;
+        const double before_mark = markedEquity(before,before_price);
+        session::PositionSnapshot snapshot{};
+        snapshot.decision_time_utc = r.decision_time;
+        snapshot.invested = before.quantity > 0;
+        snapshot.symbol = before.held_symbol;
+        if (snapshot.invested) {
+            snapshot.entry_time_utc = before.entry_time;
+            snapshot.entry_price = before.entry_price;
+            snapshot.last_price = before_price;
+            position_high = position_high > 0 ? std::max(position_high, before_price) : before_price;
+            position_low = position_low > 0 ? std::min(position_low, before_price) : before_price;
+            snapshot.highest_price_since_entry = std::max(position_high, before.entry_price);
+            snapshot.lowest_price_since_entry = std::min(position_low, before.entry_price);
+            // No configured stop price or calibrated causal forecast is present in
+            // this replay interface. Do not invent either.
+        }
+        const auto supervisor = session::assess(snapshot);
+        auto state = encode(r,before,before_mark,cfg.capital,net);
+        const bool exit_required =
+            terminal || supervisor.recommendation == session::Recommendation::EXIT_REQUIRED;
+        restrictYoungPosition(state,r,before,cfg.minimum_holding_minutes,exit_required);
+        const auto manager_q = net.predictManager(state);
+        const auto raw_action = static_cast<std::size_t>(manager_q.greedyAction(state.valid_actions));
+        const std::size_t action = choose(state,supervisor,manager_q);
+        const std::string desired = target(r,before,action);
+        check(session::targetAllowed(before.held_symbol, desired, r.decision_time),
+              "D9F4C candle: new entry/switch prohibited after 14:45 or hold past 15:15");
+        // Check data availability for every requested new holding BEFORE execution.
+        if (!desired.empty()) (void)price(desired,r.decision_time);
+        const auto execution = ledger.execute(r.decision_time,desired,price);
+        check(execution.numerical_integrity, "D9F4C candle: ledger integrity");
+        const auto after = ledger.state();
+        if (after.quantity == 0) { position_high = position_low = 0.0; }
+        else if (after.entry_time == r.decision_time) {
+            position_high = position_low = after.entry_price;
+        }
+        check(after.quantity >= 0 && after.cash >= -1e-7,
+              "D9F4C candle: short/negative cash");
+        check(after.quantity == 0 || minuteIST(r.decision_time) < cutoff,
+              "D9F4C candle: position at cutoff");
+        const double next_price = after.quantity ? price(after.held_symbol,next_time) : 0.0;
+        const double after_mark = markedEquity(after,next_price);
+        // Reward belongs to THIS action: includes execution costs at t and
+        // price movement through t+1, excludes costs of the NEXT action.
+        const double costs = execution.brokerage+execution.slippage+execution.other_costs;
+        const double net_pnl = after_mark-before_mark;
+        const double gross_pnl = net_pnl+costs;
+        LedgerTransitionInput input{};
+        input.decision_time=r.decision_time;
+        input.next_decision_time=next_time;
+        input.manager_action=action;
+        input.legal_actions=state.valid_actions;
+        input.equity_before=before_mark;
+        input.equity_after=after_mark;
+        input.gross_pnl=gross_pnl;
+        input.net_pnl=net_pnl;
+        input.brokerage=execution.brokerage;
+        input.slippage=execution.slippage;
+        input.other_costs=execution.other_costs;
+        input.reference_capital=cfg.capital;
+        input.terminal=terminal;
+        input.executed_ledger_reconciled=true;
+        auto reward=DevLedgerRewardBridge::build(input,cfg.mode);
+        DevManagerEncodedState next_state{};
+        if (terminal) {
+            next_state.decision_time=next_time;
+            next_state.valid_actions[0]=true;
+            next_state.numerical_integrity=true;
+        } else {
+            next_state=encode(data.records[i+1],after,after_mark,cfg.capital,net);
+            // A next-state mask must be causal. Emergency assessment at t+1
+            // will be performed at the next iteration before choosing.
+            restrictYoungPosition(next_state,data.records[i+1],after,
+                                  cfg.minimum_holding_minutes,false);
+        }
+        CandleDecisionAudit audit{};
+        audit.decision_time = r.decision_time;
+        audit.raw_action = raw_action;
+        audit.final_action = action;
+        audit.q_values = manager_q.values;
+        audit.legal_actions = state.valid_actions;
+        audit.held_before = before.held_symbol;
+        audit.desired = desired;
+        audit.held_after = after.held_symbol;
+        audit.supervisor_priority = session::toString(supervisor.priority);
+        audit.supervisor_recommendation = session::toString(supervisor.recommendation);
+        audit.holding_age_minutes = supervisor.age_minutes;
+        audit.stagnant = supervisor.stagnant;
+        audit.stop_triggered = supervisor.stop_triggered;
+        audit.executed_legs = execution.executed_legs;
+        for (const auto& c : r.candidates) {
+            audit.candidate_symbols[c.slot_index] = c.symbol;
+            audit.candidate_scores[c.slot_index] = c.candidate_score;
+        }
+        report.audit.push_back(std::move(audit));
+        report.steps.push_back({r.decision_time,next_time,state,next_state,
+                                action,desired,after.held_symbol,before_mark,after_mark,
+                                reward,input.terminal});
+        report.executed_legs+=execution.executed_legs;
+        if (input.terminal) {
+            check(after.quantity == 0, "D9F4C candle: terminal still invested");
+            break;
+        }
+    }
+    check(!report.steps.empty() && report.steps.back().terminal,
+          "D9F4C candle: missing 15:15 terminal decision plus next minute");
+    report.final_equity=report.steps.back().equity_after_mark;
+    return report;
+}
+void DevCandleManagerReplay::writeCsv(const std::filesystem::path& file,
+                                     const CandleReplayReport& report) {
+    std::ofstream out(file);
+    check(static_cast<bool>(out), "D9F4C candle: cannot write CSV");
+    out << "decision_time,next_decision_time,manager_action,desired_symbol,held_after,"
+           "equity_before,equity_after_mark,gross_reward,net_reward,selected_reward,"
+           "execution_costs,terminal\n";
+    out << std::setprecision(17);
+    for (const auto& s : report.steps) {
+        // CETE symbols must not contain CSV delimiters.
+        check(s.desired.find_first_of(",\n\r\"")==std::string::npos &&
+              s.held_after.find_first_of(",\n\r\"")==std::string::npos,
+              "D9F4C candle: invalid symbol for CSV");
+        out << s.decision_time << ',' << s.next_decision_time << ',' << s.action << ','
+            << s.desired << ',' << s.held_after << ',' << s.equity_before << ','
+            << s.equity_after_mark << ',' << s.reward.gross_reward << ','
+            << s.reward.net_reward << ',' << s.reward.selected_reward << ','
+            << s.reward.execution_costs << ',' << (s.terminal?1:0) << '\n';
+    }
+    check(static_cast<bool>(out), "D9F4C candle: CSV write failed");
+    // Companion diagnostic CSV; leaves the established execution CSV unchanged.
+    auto audit_file = file;
+    audit_file.replace_filename(file.stem().string() + "_decision_audit.csv");
+    std::ofstream diag(audit_file);
+    check(static_cast<bool>(diag), "D9F4C candle: cannot write audit CSV");
+    diag << "decision_time,raw_action,final_action,held_before,desired,held_after,"
+            "supervisor_priority,supervisor_recommendation,holding_age_minutes,"
+            "stagnant,stop_triggered,executed_legs";
+    for (std::size_t a=0; a<DEV_MANAGER_ACTION_COUNT; ++a) diag << ",legal_" << a;
+    for (std::size_t a=0; a<DEV_MANAGER_ACTION_COUNT; ++a) diag << ",q_" << a;
+    for (std::size_t s=0; s<DEV_AGENT_SLOT_COUNT; ++s) diag << ",slot_" << s << "_symbol,slot_" << s << "_score";
+    diag << '\n';
+    diag << std::setprecision(17);
+    for (const auto& d : report.audit) {
+        auto safe = [](const std::string& s) {
+            check(s.find_first_of(",\n\r\"") == std::string::npos,
+                  "D9F4C candle: invalid audit CSV field");
+            return s;
+        };
+        diag << d.decision_time << ',' << d.raw_action << ',' << d.final_action
+             << ',' << safe(d.held_before) << ',' << safe(d.desired)
+             << ',' << safe(d.held_after) << ',' << safe(d.supervisor_priority)
+             << ',' << safe(d.supervisor_recommendation) << ',' << d.holding_age_minutes
+             << ',' << d.stagnant << ',' << d.stop_triggered << ',' << d.executed_legs;
+        for (bool allowed : d.legal_actions) diag << ',' << (allowed ? 1 : 0);
+        for (double q : d.q_values) diag << ',' << q;
+        for (std::size_t s=0; s<DEV_AGENT_SLOT_COUNT; ++s)
+            diag << ',' << safe(d.candidate_symbols[s]) << ',' << d.candidate_scores[s];
+        diag << '\n';
+    }
+    check(static_cast<bool>(diag), "D9F4C candle: audit CSV write failed");
+}
+}

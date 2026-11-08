@@ -1,0 +1,38 @@
+#pragma once
+#include <cstddef>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace cete::replay {
+struct DecisionStatus {
+    bool allowed = false;
+    bool forwardLabelEligible = false; // offline labels ONLY; never use to choose live actions
+    std::string reason;
+};
+struct UniverseStatus {
+    bool ready = false;
+    std::string reason;
+    std::vector<std::string> eligibleStocks;
+    std::map<std::string, DecisionStatus> byStock;
+};
+class ReplayEligibilityGate {
+public:
+    // Throws on malformed input, duplicates, missing required columns, inconsistent report flags.
+    void load(const std::string& dailyCsv, const std::string& decisionCsv);
+    DecisionStatus check(const std::string& date, const std::string& time,
+                         const std::string& symbol) const;
+    UniverseStatus evaluate(const std::string& date, const std::string& time,
+                            const std::vector<std::string>& universe,
+                            std::size_t minCandidates = 5) const;
+    std::size_t decisionRows() const noexcept { return decisions_.size(); }
+    std::size_t dailyRows() const noexcept { return daily_.size(); }
+private:
+    struct Daily { bool decisionEligible=false; bool fullSessionEligible=false; std::string reason; };
+    struct Decision { bool eligible=false; bool forward=false; bool benchmark=false;
+                      bool oneMinute=false; bool five=false; bool fifteen=false;
+                      bool warmup=false; std::string reason; };
+    std::map<std::string,Daily> daily_;
+    std::map<std::string,Decision> decisions_;
+};
+} // namespace cete::replay

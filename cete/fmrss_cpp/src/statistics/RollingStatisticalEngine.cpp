@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <deque>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -130,20 +131,47 @@ RollingStatisticalEngine::update(
     // MAD
     // --------------------------------------------------------
 
+    // Reuse the median already computed above.  The original
+    // RobustStatistics::medianAbsoluteDeviation(values) recomputed
+    // that same median, and robustZScore(value, values) recomputed
+    // both median and MAD.  This retains the same median routine,
+    // deviation order, epsilon threshold, and arithmetic expression.
+    std::vector<double> deviations;
+    deviations.reserve(values.size());
+    for (const double observation : values)
+    {
+        deviations.push_back(
+            std::abs(observation - features.rolling_median));
+    }
+
     features.rolling_mad =
-        RobustStatistics::medianAbsoluteDeviation(values);
+        RobustStatistics::median(deviations);
 
     features.has_mad =
         std::isfinite(features.rolling_mad);
 
     // --------------------------------------------------------
-    // Robust Z-score
+    // Robust Z-score: identical formula, no duplicate sorts.
     // --------------------------------------------------------
-
-    features.robust_z_score =
-        RobustStatistics::robustZScore(
-            value,
-            values);
+    if (!std::isfinite(value) || values.empty() ||
+        !features.has_median || !features.has_mad)
+    {
+        features.robust_z_score =
+            std::numeric_limits<double>::quiet_NaN();
+    }
+    else if (features.rolling_mad <= 1.0e-12)
+    {
+        features.robust_z_score = 0.0;
+    }
+    else
+    {
+        constexpr double NORMAL_CONSISTENCY_CONSTANT =
+            0.6744897501960817;
+        features.robust_z_score =
+            NORMAL_CONSISTENCY_CONSTANT *
+            (value - features.rolling_median) /
+            features.rolling_mad;
+    }
 
     features.has_robust_z_score =
         std::isfinite(features.robust_z_score);

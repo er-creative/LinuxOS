@@ -79,6 +79,11 @@ void VolatilityFeatureEngine::TimeframeState::reset() noexcept
     simple_returns.clear();
 
     log_returns.clear();
+
+    cached_return_stddev_20 = volatilityFeatureNaN();
+    cached_return_stddev_50 = volatilityFeatureNaN();
+    cached_realized_volatility_20 = volatilityFeatureNaN();
+    cached_realized_volatility_50 = volatilityFeatureNaN();
 }
 
 
@@ -604,6 +609,18 @@ VolatilityFeatureEngine::updateTimeframe(
     }
 
 
+    // Preserve the original two-pass population standard-deviation formula.
+    // Only a new candle can change these four rolling statistics.
+    state.cached_return_stddev_20 =
+        calculateStandardDeviation(state.simple_returns, STDDEV_20_PERIOD);
+    state.cached_return_stddev_50 =
+        calculateStandardDeviation(state.simple_returns, STDDEV_50_PERIOD);
+    state.cached_realized_volatility_20 =
+        calculateStandardDeviation(state.log_returns, STDDEV_20_PERIOD);
+    state.cached_realized_volatility_50 =
+        calculateStandardDeviation(state.log_returns, STDDEV_50_PERIOD);
+
+
     // ========================================================================
     // Commit current candle as previous candle for next update
     // ========================================================================
@@ -736,11 +753,7 @@ VolatilityFeatureEngine::makeFeatures(
     // Return standard deviation 20
     // ========================================================================
 
-    const double stddev20 =
-        calculateStandardDeviation(
-            state.simple_returns,
-            STDDEV_20_PERIOD
-        );
+    const double stddev20 = state.cached_return_stddev_20;
 
 
     if (
@@ -762,11 +775,7 @@ VolatilityFeatureEngine::makeFeatures(
     // Return standard deviation 50
     // ========================================================================
 
-    const double stddev50 =
-        calculateStandardDeviation(
-            state.simple_returns,
-            STDDEV_50_PERIOD
-        );
+    const double stddev50 = state.cached_return_stddev_50;
 
 
     if (
@@ -792,11 +801,7 @@ VolatilityFeatureEngine::makeFeatures(
     // Not annualized.
     // ========================================================================
 
-    const double realized20 =
-        calculateStandardDeviation(
-            state.log_returns,
-            STDDEV_20_PERIOD
-        );
+    const double realized20 = state.cached_realized_volatility_20;
 
 
     if (
@@ -818,11 +823,7 @@ VolatilityFeatureEngine::makeFeatures(
     // Realized Volatility 50
     // ========================================================================
 
-    const double realized50 =
-        calculateStandardDeviation(
-            state.log_returns,
-            STDDEV_50_PERIOD
-        );
+    const double realized50 = state.cached_realized_volatility_50;
 
 
     if (

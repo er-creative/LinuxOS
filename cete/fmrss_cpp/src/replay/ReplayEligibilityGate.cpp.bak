@@ -1,0 +1,171 @@
+#include "cete/replay/ReplayEligibilityGate.hpp"
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+namespace cete::replay {
+namespace {
+std::string trim(std::string s) {
+    auto first=s.find_first_not_of(" \t\r\n");
+    if(first==std::string::npos)return {};
+    auto last=s.find_last_not_of(" \t\r\n");
+    return s.substr(first,last-first+1);
+}
+std::vector<std::string> parseCsv(const std::string& line) {
+    std::vector<std::string> fields;
+    std::string value; bool quoted=false;
+    for(std::size_t i=0;i<line.size();++i) {
+        char c=line[i];
+        if(c=='"') {
+            if(quoted && i+1<line.size() && line[i+1]=='"') {value+='"';++i;}
+            else quoted=!quoted;
+        } else if(c==','&&!quoted) {fields.push_back(trim(value));value.clear();}
+        else value+=c;
+    }
+    if(quoted)throw std::runtime_error("Unclosed CSV quote");
+    fields.push_back(trim(value));return fields;
+}
+struct Reader {
+    std::ifstream file;
+    std::map<std::string,std::size_t> columns;
+    std::size_t line=1;
+    explicit Reader(const std::string& path):file(path) {
+        if(!file)throw std::runtime_error("Cannot open CSV: "+path);
+        std::string header;
+        if(!std::getline(file,header))throw std::runtime_error("Empty CSV: "+path);
+        if(header.size()>=3 && (unsigned char)header[0]==0xEF &&
+           (unsigned char)header[1]==0xBB && (unsigned char)header[2]==0xBF)
+            header.erase(0,3);
+        auto names=parseCsv(header);
+        for(std::size_t i=0;i<names.size();++i)
+            if(!columns.emplace(names[i],i).second)
+                throw std::runtime_error("Duplicate column: "+names[i]);
+    }
+    void require(std::initializer_list<const char*> names) const {
+        for(const char* n:names)if(!columns.count(n))
+            throw std::runtime_error(std::string("Missing CSV column: ")+n);
+    }
+    std::string get(const std::vector<std::string>& f,const std::string& n) const {
+        auto i=columns.at(n);
+        if(i>=f.size())throw std::runtime_error("Short CSV row at line "+std::to_string(line));
+        return f[i];
+    }
+    bool flag(const std::vector<std::string>& f,const std::string& n) const {
+        auto v=get(f,n);
+        if(v!="0"&&v!="1")throw std::runtime_error("Invalid boolean "+n+" at line "+std::to_string(line));
+        return v=="1";
+    }
+    bool next(std::vector<std::string>& f) {
+        std::string s;
+        while(std::getline(file,s)) {
+            ++line;
+            if(trim(s).empty())continue;
+            f=parseCsv(s);return true;
+        }
+        return false;
+    }
+};
+std::string dailyKey(const std::string& d,const std::string& s){return d+"|"+s;}
+std::string decisionKey(const std::string& d,const std::string& t,const std::string& s){return d+"|"+t+"|"+s;}
+int minuteOfDay(const std::string& s) {
+    if(s.size()!=5||s[2]!=':'||!std::isdigit((unsigned char)s[0])||
+       !std::isdigit((unsigned char)s[1])||!std::isdigit((unsigned char)s[3])||
+       !std::isdigit((unsigned char)s[4]))return -1;
+    int h=(s[0]-'0')*10+s[1]-'0',m=(s[3]-'0')*10+s[4]-'0';
+    return h<24&&m<60?h*60+m:-1;
+}
+} // namespace
+void ReplayEligibilityGate::load(const std::string& dailyCsv,const std::string& decisionCsv) {
+    std::map<std::string,Daily> daily;
+    std::map<std::string,Decision> decisions;
+    {
+        Reader r(dailyCsv);
+        r.require({"symbol","date","decision_data_eligible","full_session_eligible","reason"});
+        std::vector<std::string> f;
+        while(r.next(f)) {
+            auto sym=r.get(f,"symbol"),date=r.get(f,"date");
+            if(sym.empty()||date.size()!=10)throw std::runtime_error("Invalid daily key");
+            Daily d{r.flag(f,"decision_data_eligible"),r.flag(f,"full_session_eligible"),r.get(f,"reason")};
+            if(!daily.emplace(dailyKey(date,sym),std::move(d)).second)
+                throw std::runtime_error("Duplicate daily row: "+date+" "+sym);
+        }
+    }
+    {
+        Reader r(decisionCsv);
+        r.require({"date","time","symbol","one_minute_present","completed_5m_available",
+                   "completed_15m_available","benchmark_available","warmup_met",
+                   "decision_eligible","forward_label_eligible","reason"});
+        std::vector<std::string> f;
+        while(r.next(f)) {
+            auto date=r.get(f,"date"),time=r.get(f,"time"),sym=r.get(f,"symbol");
+            int minute=minuteOfDay(time);
+            if(date.size()!=10||sym.empty()||minute<555||minute>=915)
+                throw std::runtime_error("Invalid decision key at line "+std::to_string(r.line));
+            Decision d;
+            d.oneMinute=r.flag(f,"one_minute_present");
+            d.five=r.flag(f,"completed_5m_available");
+            d.fifteen=r.flag(f,"completed_15m_available");
+            d.benchmark=r.flag(f,"benchmark_available");
+            d.warmup=r.flag(f,"warmup_met");
+            d.eligible=r.flag(f,"decision_eligible");
+            d.forward=r.flag(f,"forward_label_eligible");
+            d.reason=r.get(f,"reason");
+            // Fail closed if a report incorrectly labels a structurally invalid row eligible.
+            if(d.eligible&&!(d.oneMinute&&d.five&&d.fifteen&&d.benchmark&&d.warmup))
+                throw std::runtime_error("Inconsistent eligible row at line "+std::to_string(r.line));
+            if(!decisions.emplace(decisionKey(date,time,sym),std::move(d)).second)
+                throw std::runtime_error("Duplicate decision row: "+date+" "+time+" "+sym);
+        }
+    }
+    if(daily.empty()||decisions.empty())throw std::runtime_error("Empty eligibility reports");
+    daily_.swap(daily);decisions_.swap(decisions);
+}
+DecisionStatus ReplayEligibilityGate::check(const std::string& date,const std::string& time,
+                                             const std::string& symbol) const {
+    int minute=minuteOfDay(time);
+    if(minute<555||minute>=915)return {false,false,"OUTSIDE_DECISION_WINDOW"};
+    auto day=daily_.find(dailyKey(date,symbol));
+    if(day==daily_.end())return {false,false,"DAILY_REPORT_MISSING"};
+    if(!day->second.decisionEligible)return {false,false,"DAILY_INELIGIBLE:"+day->second.reason};
+    auto it=decisions_.find(decisionKey(date,time,symbol));
+    if(it==decisions_.end())return {false,false,"DECISION_REPORT_MISSING"};
+    const auto& d=it->second;
+    if(!d.eligible)return {false,false,d.reason.empty()?"DECISION_INELIGIBLE":d.reason};
+    return {true,d.forward,"OK"};
+}
+UniverseStatus ReplayEligibilityGate::evaluate(const std::string& date,const std::string& time,
+    const std::vector<std::string>& universe,std::size_t minCandidates) const {
+    UniverseStatus out;
+    int decisionMinute=minuteOfDay(time);
+    if(decisionMinute<555||decisionMinute>=915) {
+        out.reason="OUTSIDE_DECISION_WINDOW";return out;
+    }
+    if(minCandidates==0||universe.empty()||minCandidates>universe.size()) {
+        out.reason="INVALID_UNIVERSE_CONFIGURATION";return out;
+    }
+    std::set<std::string> unique;
+    for(const auto& symbol:universe) {
+        if(symbol.empty()||!unique.insert(symbol).second) {
+            out.reason="DUPLICATE_OR_EMPTY_SYMBOL";return out;
+        }
+    }
+    // 3B decision CSV has STOCK rows only. Benchmark availability is a
+    // validated field in each stock row; the benchmark has a daily row.
+    auto benchmarkDay=daily_.find(dailyKey(date,"NIFTY%2050"));
+    if(benchmarkDay==daily_.end()||!benchmarkDay->second.decisionEligible) {
+        out.reason="BENCHMARK_DAILY_BLOCKED";return out;
+    }
+    for(const auto& symbol:universe) {
+        auto s=check(date,time,symbol);
+        out.byStock.emplace(symbol,s);
+        if(s.allowed)out.eligibleStocks.push_back(symbol);
+    }
+    out.ready=out.eligibleStocks.size()>=minCandidates;
+    out.reason=out.ready?"READY":"INSUFFICIENT_ELIGIBLE_STOCKS";
+    return out;
+}
+} // namespace cete::replay

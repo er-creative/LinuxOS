@@ -1,0 +1,65 @@
+Market data: /home/devinderjeet/fmrss_cpp/data/validation/phase319_3a/kite_downloads
+
+mode = TESTING
+mode = LIVE
+
+testing_type = BACKTEST
+testing_type = FORWARD
+testing_type = PAPER
+
+##########################
+# Live setting
+###########################
+[DevManager_002]
+enabled = true
+direction = SHORT
+mode = LIVE
+testing_type = PAPER
+capital = 7000
+allocation_percent = 75
+universe_file = config/shares.txt
+top_k = 5
+agents = DevAgent_006,DevAgent_007,DevAgent_008,DevAgent_009,DevAgent_010
+
+##########################
+# Forward Testing setting
+###########################
+[DevManager_001]
+enabled = true
+direction = LONG
+mode = TESTING
+testing_type = FORWARD
+capital = 7000
+allocation_percent = 75
+universe_file = config/shares.txt
+top_k = 5
+agents = DevAgent_001,DevAgent_002,DevAgent_003,DevAgent_004,DevAgent_005
+
+##########################
+# Paper Testing setting
+###########################
+
+[DevManager_001]
+enabled = true
+direction = LONG
+mode = TESTING
+testing_type = PAPER
+capital = 7000
+allocation_percent = 75
+universe_file = config/shares.txt
+top_k = 5
+agents = DevAgent_001,DevAgent_002,DevAgent_003,DevAgent_004,DevAgent_005
+
+##########################
+# Backtesting setting
+###########################
+[DevManager_002]
+enabled = false
+direction = SHORT
+mode = TESTING
+testing_type = BACKTEST
+capital = 7000
+allocation_percent = 75
+universe_file = config/shares.txt
+top_k = 5
+agents = DevAgent_006,DevAgent_007,DevAgent_008,DevAgent_009,DevAgent_010

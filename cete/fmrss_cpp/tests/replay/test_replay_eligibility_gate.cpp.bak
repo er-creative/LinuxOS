@@ -1,0 +1,37 @@
+#include "cete/replay/ReplayEligibilityGate.hpp"
+#include <cassert>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+namespace fs=std::filesystem;
+using cete::replay::ReplayEligibilityGate;
+int main(int argc,char**argv){
+ try {
+  if(argc!=2){std::cerr<<"Usage: "<<argv[0]<<" output/phase319_3b\n";return 2;}
+  fs::path p=argv[1];ReplayEligibilityGate gate;
+  gate.load((p/"daily_eligibility.csv").string(),(p/"decision_eligibility.csv").string());
+  const std::vector<std::string> universe={"ADANIPORTS","AXISBANK","BHARTIARTL","HCLTECH","HDFCBANK","ICICIBANK","ITC","NTPC","RELIANCE","SBIN"};
+  assert(gate.dailyRows()>0&&gate.decisionRows()>0);
+  auto opening=gate.evaluate("2025-10-29","09:15",universe,5);
+  if(opening.ready)throw std::runtime_error("Opening should be blocked under current 3B rules");
+  auto ready=gate.evaluate("2025-10-29","09:29",universe,5);
+  if(!ready.ready||ready.eligibleStocks.size()!=10)throw std::runtime_error("Expected 10 eligible stocks at 09:29");
+  auto end=gate.evaluate("2025-10-29","15:15",universe,5);
+  if(end.ready)throw std::runtime_error("15:15 must be outside decision window");
+  auto absent=gate.check("2025-10-29","09:29","NOT_A_STOCK");
+  if(absent.allowed)throw std::runtime_error("Unknown symbol was allowed");
+  auto missing=gate.check("2024-01-01","09:29","RELIANCE");
+  if(missing.allowed)throw std::runtime_error("Unknown date was allowed");
+  auto invalidK=gate.evaluate("2025-10-29","09:29",universe,11);
+  if(invalidK.ready)throw std::runtime_error("Invalid K allowed");
+  auto label=gate.check("2025-10-29","09:29","RELIANCE");
+  if(!label.allowed)throw std::runtime_error("Expected RELIANCE decision eligible");
+  std::cout<<"PASS CETE Phase 3.19.3C eligibility gate\n"
+           <<"Daily rows: "<<gate.dailyRows()<<"\nDecision rows: "<<gate.decisionRows()<<"\n"
+           <<"09:15: "<<opening.reason<<"\n09:29: "<<ready.reason<<" ("<<ready.eligibleStocks.size()<<" stocks)\n"
+           <<"15:15: "<<end.reason<<"\n";
+  return 0;
+ }catch(const std::exception&e){std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}
+}
